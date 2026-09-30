@@ -2,27 +2,32 @@
 
 A simple web interface for [BetterDeclipper](https://github.com/Qupci/BetterDeclipper), the offline
 declipper that restores clipped, limited and lossy-encoded peaks. Drop in a file, press **Declip**, and
-compare the result with the input in an iZotope RX-style view: a waveform with a dB scale over a sharp
-spectrogram, at the peaks the restoration changed the most.
+look at the result the way iZotope RX shows audio: a waveform with a dB scale over a spectrogram in RX's
+colors and resolution, for the whole file and up close at the peaks the restoration changed the most.
 
-![BetterDeclipper GUI](docs/screenshot.png)
+![BetterDeclipper GUI: the whole result](docs/screenshot.png)
+
+![A snippet: 3 seconds at the most restored peak](docs/snippets.png)
 
 ## What it does
 
 - **Declip** a file with the declipper's presets (`fast` ... `best`) and modes (`auto` analysis,
   `hard`, `soft`, `limiter`, `legacy`); the analysis of how the file was clipped is shown in plain text.
-- **See the result** in a 3 s view: waveform with a dB amplitude ruler, a spectrogram with a log or linear
-  frequency axis, and an h:m:s timeline. Switch between **Before** (the input), **After** (the result;
-  what the restoration added is drawn in orange) and **Delta** (after - before), and between channels.
-- **Jump between the most restored peaks**: up to 10 snippets, most restored first, each centered on its
-  peak and at least 5 s apart so they show different moments; the channel follows the peak. Or type any
-  time (`1:23.5`).
+- **Full length**: the whole result, with numbered flags at the most restored peaks. Click a flag, or any
+  other moment, to look at it closely in **Snippets**.
+- **Snippets**: 3 s views, each centered on one of the most restored peaks (up to 10, most restored first,
+  at least 5 s apart so they show different moments; the channel follows the peak). Step through them, or
+  type any time (`1:23.5`).
+- Both views have a waveform with a dB amplitude ruler, a spectrogram with a log or linear frequency axis,
+  and an h:m:s timeline. Switch between **Before** (the input), **After** (the result; what the
+  restoration added is drawn in orange) and **Delta** (after - before), and between channels.
 - **Compare settings**: every run is kept in a list of results. The view stays where it is, so a run with
   another preset or mode is compared at the same place. All waveforms share one scale, set by the highest
   peak of all results (restored peaks often exceed 0 dBFS, a red line marks it); remove a result and the
   scale follows the remaining ones.
-- **Listen** to the snippet of the current view. All versions play at one common gain (turned down only
-  when the highest peak of all results exceeds 0 dBFS), so their levels compare fairly and nothing clips.
+- **Listen** to the whole result or to the snippet on view. All versions play at one common gain (turned
+  down only when the highest peak of all results exceeds 0 dBFS), so their levels compare fairly and
+  nothing clips.
 - **Download** as 32-bit float WAV (keeps peaks above 0 dBFS), 24/16-bit WAV or 24/16-bit FLAC, with
   optional peak normalization. PCM and FLAC cannot store peaks above 0 dBFS, so those files are turned
   down to the chosen peak level instead of being clipped again.
@@ -30,8 +35,8 @@ spectrogram, at the peaks the restoration changed the most.
   a zip, or have them saved to a folder. Results are named like the command line names them,
   `song [auto clip normal].wav`.
 
-Keyboard shortcuts in the view: **B** / **A** / **D** for before / after / delta, **←** / **→** for the
-previous / next snippet.
+Keyboard shortcuts: **B** / **A** / **D** for before / after / delta, **F** / **S** for the full length /
+snippets tab, **←** / **→** for the previous / next snippet.
 
 ## Installation
 
@@ -92,10 +97,21 @@ temporary folder that is removed about an hour after the browser tab was closed,
 
 ## The view
 
-The spectrogram is computed like a multi-resolution RX view and mapped straight onto the pixels: several
-Hann-window STFTs (window lengths 6 to 186 ms, 8x time overlap, up to 8x zero padding), where every pixel
-row uses the window whose time blur matches its frequency blur (long windows for the lows, short ones for
-the highs), and bins and frames are reduced onto rows and columns by their maximum so thin harmonics and
-clicks stay visible. The colors run from black at -120 dB through blue and cyan to orange and white at
--6 dB (0 dB is a full-scale sine). Clipping shows up as a haze of distortion between the harmonics and as
-vertical smears at the peaks; a good restoration clears them, and the delta view shows what was added.
+The spectrogram was matched to iZotope RX: RX screenshots of a song were turned back into dB through RX's
+own color bar and compared pixel by pixel with renderings of the same audio.
+
+- **Colors**: RX's default gradient, black at -120 dB through navy, brown and orange to white at 0 dB
+  (0 dB is a full-scale sine, as in RX).
+- **Log axis**: RX's, linear in ln(1 + f / 100 Hz) from 0 Hz to Nyquist (not a plain logarithm, which would
+  stretch the lowest octaves).
+- **Snippets, linear axis**: like RX's automatic STFT at that zoom, one Hann window of about 5.5 pixel
+  columns (13.6 ms for 3 s), 16x time overlap and 8x zero padding (correlation with RX 0.995, 2.4 dB rms).
+- **Snippets, log axis**: RX's multi-resolution mode at FFT size 512: 512, 1024 and 2048-sample windows
+  (at 44.1 kHz) above 1/8 of Nyquist, between 1/32 and 1/8, and below, cross-faded at the edges
+  (correlation 0.993).
+- **Full length**: one 2048 (linear) or 4096-sample (log) window at 44.1 kHz, its power averaged over each
+  column.
+
+Bins and frames are reduced onto rows and columns by their maximum, so thin harmonics and clicks stay
+visible. Clipping shows up as a haze of distortion between the harmonics and as vertical smears at the
+peaks; a good restoration clears them, and the delta view shows what was added.

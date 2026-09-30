@@ -22,8 +22,11 @@ from .processing import db, declip_array, output_gain, output_name, report_lines
 from .snippets import VIEW_S, RestorationMap, Snippet, rank
 
 SEEKABLE = {"WAV", "WAVEX", "AIFF", "FLAC", "W64", "RF64", "CAF"}  # sample-exact random access
-SPEC_CACHE = 24      # spectrograms kept per session (~1 MB each)
+SPEC_CACHE = 24      # snippet spectrograms kept per session (~1 MB each)
+OV_CACHE = 8         # full-length spectrograms kept per session (~1 MB each)
+FULL_AUDIO_KEEP = 3  # full-length playback files kept per session (tens of MB each)
 FADE_S = 0.005       # fade in/out of the snippet audio (no clicks at the cut)
+SNAP_PX = 6          # a click on the overview this close to a snippet's flag selects that snippet
 
 _created_dirs = set()  # work folders of this process (sessions end with it)
 
@@ -169,6 +172,7 @@ class Session:
         self.cancel_batch = threading.Event()  # Stop in batch mode
         self._dir = None
         self._clips = []
+        self.tab = "full"         # sub-tab on view: 'full' (full length) or 'snip' (snippets)
         self._reset()
 
     def __deepcopy__(self, memo):  # gr.State deep-copies its value; a session is one live object
@@ -184,7 +188,11 @@ class Session:
         self.channel = 0
         self.selected = None      # id of the result on view
         self.specs = OrderedDict()
+        self.ov_specs = OrderedDict()
+        self.envs = {}            # ('y' | 'x' | 'd', result id, channel) -> full-length waveform envelope
+        self.full_files = OrderedDict()
         self.peaks = {}           # (result id or 0 = input, sample, channel) -> local peak
+        self.shown = {}           # what each image / player on the page shows (see view_keys)
 
     # ---- files ----------------------------------------------------------------------------------
     @property
@@ -267,11 +275,13 @@ class Session:
             self.runs.remove(run)
             if self.selected == rid:
                 self.selected = self.runs[-1].id if self.runs else None
-            for k in [k for k in self.specs if k[1] == rid]:
-                del self.specs[k]
-            for k in [k for k in self.peaks if k[0] == rid]:
-                del self.peaks[k]
+            stale = [self.full_files.pop(k) for k in [k for k in self.full_files if k[1] == rid]]
+            for store, i in ((self.specs, 1), (self.ov_specs, 1), (self.envs, 1), (self.peaks, 0)):
+                for k in [k for k in store if k[i] == rid]:
+                    del store[k]
         shutil.rmtree(os.path.dirname(run.raw_path), ignore_errors=True)
+        for p in stale:
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
 
     def history(self):
         with self.lock:
@@ -441,3 +451,124 @@ class Session:
         for p in old:
             shutil.rmtree(p, ignore_errors=True)
         return path
+
+    # ---- full length ----------------------------------------------------------------------------
+    def _reader(self, view, run, ch):
+        """read(a, b) of one channel of the input, a result or their difference, zeros outside the file."""
+        inp = self.input
+        ry = lambda a, b: read_segment(inp.view_path, a, b, inp.frames, inp.channels)[:, ch]
+        if view == "Before" or run is None:
+            return ry
+        rx = lambda a, b: read_segment(run.raw_path, a, b, inp.frames, inp.channels)[:, ch]
+        return rx if view == "After" else (lambda a, b: rx(a, b) - ry(a, b))
+
+    def _envelope(self, view, run, ch):
+        """Full-length waveform envelope of the input ('Before'), a result ('After') or the delta."""
+        key = (view, run.id if run is not None and view != "Before" else 0, ch)
+        with self.lock:
+            env = self.envs.get(key)
+        if env is None:
+            env = R.envelope_stream(self._reader(view, run, ch), self.input.frames)
+            with self.lock:
+                self.envs[key] = env
+        return env
+
+    def render_overview(self, view, scale):
+        """The whole file as an RGB image, with a numbered flag per snippet and the snippet view's region
+        tinted."""
+        with self.lock:
+            inp, run, ch, peak = self.input, self.run(), self.channel, self.peak_ref()
+            start, n = self.region()
+            snippets, idx, custom = list(self.snippets), self.snip_idx, self.custom
+        if run is None:
+            view = "Before"
+        sr = inp.sr
+        key = (view, run.id if view != "Before" else 0, ch, scale)
+        with self.lock:
+            spec = self.ov_specs.get(key)
+            if spec is not None:
+                self.ov_specs.move_to_end(key)
+        if spec is None:
+            spec = R.overview_spectrogram(self._reader(view, run, ch), inp.frames, sr, scale).astype(np.float16)
+            with self.lock:
+                self.ov_specs[key] = spec
+                while len(self.ov_specs) > OV_CACHE:
+                    self.ov_specs.popitem(last=False)
+        ey = self._envelope("Before", run, ch)
+        if view == "Before":
+            layers, title = [(ey, R.BLUE)], "BEFORE  ·  input  ·  full length"
+        elif view == "After":
+            layers, title = [(self._envelope("After", run, ch), R.ORANGE), (ey, R.BLUE)], f"AFTER  ·  {run.name}"
+        else:
+            layers = [(ey, R.GHOST), (self._envelope("Delta", run, ch), R.ORANGE)]
+            title = f"DELTA  ·  {run.name}  ·  after - before"
+        markers = [] if not snippets or snippets[0].fallback else \
+            [(s.center / sr, str(i + 1), custom is None and i == idx) for i, s in enumerate(snippets)]
+        dur = inp.frames / sr
+        dec = 0 if dur >= 60 else 3
+        info = f"{channel_names(inp.channels)[ch]}  ·  {R.fmt_time(0, dec)} - {R.fmt_time(dur, dec)}"
+        return R.render_view(spec.astype(np.float32), layers, sr, 0.0, inp.frames, peak, scale, title=title,
+                             info=info, title_color=R.VIEW_COLORS[view], markers=markers,
+                             region=(start / sr, (start + n) / sr))
+
+    def playback_gain_db(self):
+        """Gain of both players: turned down by the highest peak of all results when it exceeds 0 dBFS."""
+        return -max(db(self.peak_ref()), 0.0)
+
+    def full_audio(self, view):
+        """Full-length 16-bit WAV of the view (all channels) for the player, at the snippet player's gain."""
+        with self.lock:
+            inp, run = self.input, self.run()
+            gain_db = self.playback_gain_db()
+        if run is None:
+            view = "Before"
+        key = (view, run.id if view != "Before" else 0, round(gain_db, 6))
+        with self.lock:
+            path = self.full_files.get(key)
+        if path and os.path.exists(path):
+            return path
+        d = os.path.join(self.single_dir, "full", str(time.time_ns()))
+        os.makedirs(d, exist_ok=True)
+        tag = "before" if view == "Before" else f"{view.lower()} result {run.id}"
+        path = os.path.join(d, f"{inp.stem} {tag}.wav")
+        g = np.float32(10 ** (gain_db / 20))
+        with sf.SoundFile(path, "w", inp.sr, inp.channels, "PCM_16", format="WAV") as f:
+            for a in range(0, inp.frames, 1 << 20):
+                b = min(inp.frames, a + (1 << 20))
+                _, sig = self._signals(view, run, a, b)
+                f.write(sig * g)
+        with self.lock:
+            self.full_files[key] = path
+            old = []
+            while len(self.full_files) > FULL_AUDIO_KEEP:
+                old.append(self.full_files.popitem(last=False)[1])
+        for p in old:
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
+        return path
+
+    def goto_x(self, x):
+        """A click on the overview at column x: the snippet whose flag is there, else that moment."""
+        with self.lock:
+            inp = self.input
+            if self.snippets and not self.snippets[0].fallback:
+                xs = np.array([s.center for s in self.snippets]) / inp.frames * R.PLOT_W
+                i = int(np.argmin(np.abs(xs - x)))
+                if abs(xs[i] - x) <= SNAP_PX:
+                    self.goto(i)
+                    return
+            self.goto_time(float(np.clip(x / R.PLOT_W, 0.0, 1.0)) * inp.frames / inp.sr)
+
+    def view_keys(self, view, scale):
+        """What each image and player shows, so unchanged ones are not rendered and sent again (and a playing
+        full-length player is not restarted by navigating the snippets)."""
+        with self.lock:
+            run = self.run()
+            v = view if run is not None else "Before"
+            rid = run.id if run is not None and v != "Before" else 0
+            peak = round(self.peak_ref(), 9)
+            start, n = self.region()
+            snips = tuple((s.center, s.channel, s.fallback) for s in self.snippets)
+            return {"ov_img": (v, rid, self.channel, scale, peak, snips, self.snip_idx, self.custom, start),
+                    "ov_audio": (v, rid, peak),
+                    "sn_img": (v, rid, start, n, self.channel, scale, peak),
+                    "sn_audio": (v, rid, start, n, peak)}
