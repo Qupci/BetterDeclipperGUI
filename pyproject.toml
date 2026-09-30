@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "betterdeclipper-gui"
+dynamic = ["version"]
+description = "Web interface for BetterDeclipper: declip audio, compare before / after / delta in an RX-style view, batch processing"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Qupci" }]
+keywords = ["audio", "declipping", "declipper", "restoration", "clipping", "gui", "gradio"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Analysis",
+    "Environment :: Web Environment",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+# The declipper itself (pulls torch). For GPU processing install the CUDA build of torch first (see README);
+# pip otherwise pulls the CPU build. The archive URL needs no git.
+dependencies = [
+    "betterdeclipper @ https://github.com/Qupci/BetterDeclipper/archive/refs/heads/main.zip",
+    "gradio>=6.29,<7",
+    "numpy",
+    "scipy",
+    "soundfile",
+    "pillow",
+    "pandas",
+]
+
+[project.urls]
+Homepage = "https://github.com/Qupci/BetterDeclipperGUI"
+Declipper = "https://github.com/Qupci/BetterDeclipper"
+
+[project.scripts]
+betterdeclipper-gui = "betterdeclipper_gui.app:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "betterdeclipper_gui.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["betterdeclipper_gui*"]

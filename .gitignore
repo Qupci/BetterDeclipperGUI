@@ -1,0 +1,13 @@
+# audio (kept locally, not versioned)
+*.wav
+*.flac
+*.mp3
+*.ogg
+# python
+__pycache__/
+*.pyc
+.venv/
+# packaging
+build/
+dist/
+*.egg-info/
