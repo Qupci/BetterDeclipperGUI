@@ -5,6 +5,9 @@ declipper that restores clipped, limited and lossy-encoded peaks. Drop in a file
 look at the result the way iZotope RX shows audio: a waveform with a dB scale over a spectrogram in RX's
 colors and resolution, for the whole file and up close at the peaks the restoration changed the most.
 
+No GPU, or no Python? Run it on Google Colab's free GPU with one click:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Qupci/BetterDeclipperGUI/blob/main/BetterDeclipperGUI.ipynb)
+
 ![BetterDeclipper GUI: the whole result](docs/screenshot.png)
 
 ![A snippet: 3 seconds at the most restored peak](docs/snippets.png)
@@ -13,11 +16,14 @@ colors and resolution, for the whole file and up close at the peaks the restorat
 
 - **Declip** a file with the declipper's presets (`fast` ... `best`) and modes (`auto` analysis,
   `hard`, `soft`, `limiter`, `legacy`); the analysis of how the file was clipped is shown in plain text.
+  The **Declip** button sits right under the settings, so they are in sight when you press it. It can be
+  pressed while the file is still uploading: the file is declipped as soon as it is there, with the
+  settings as they are then.
 - **Full length**: the whole result, with numbered flags at the most restored peaks. Click a flag, or any
-  other moment, to look at it closely in **Snippets**.
+  other moment, to look at it closely in **Snippets**; Shift+click (or Ctrl+click) plays from there instead.
 - **Snippets**: 3 s views, each centered on one of the most restored peaks (up to 10, most restored first,
   at least 5 s apart so they show different moments; the channel follows the peak). Step through them, or
-  type any time (`1:23.5`).
+  type any time (`1:23.5`). A moment picked before the first result stays on view when it comes in.
 - Both views have a waveform with a dB amplitude ruler, a spectrogram with a log or linear frequency axis,
   and an h:m:s timeline. Switch between **Before** (the input), **After** (the result; what the
   restoration added is drawn in orange) and **Delta** (after - before), and between channels.
@@ -25,9 +31,12 @@ colors and resolution, for the whole file and up close at the peaks the restorat
   another preset or mode is compared at the same place. All waveforms share one scale, set by the highest
   peak of all results (restored peaks often exceed 0 dBFS, a red line marks it); remove a result and the
   scale follows the remaining ones.
-- **Listen** to the whole result or to the snippet on view. All versions play at one common gain (turned
-  down only when the highest peak of all results exceeds 0 dBFS), so their levels compare fairly and
-  nothing clips.
+- **Listen** to the whole result or to the snippet on view: **Space** plays and pauses, a playhead runs
+  over the view, and a click plays from a moment. Playback carries on when you switch between before,
+  after and delta or between results (the new version takes over at the same moment, with a short
+  cross-fade), so you hear the difference right away. All versions play at one common gain (turned down
+  only when the highest peak of all results exceeds 0 dBFS), so their levels compare fairly and nothing
+  clips.
 - **Download** as 32-bit float WAV (keeps peaks above 0 dBFS), 24/16-bit WAV or 24/16-bit FLAC, with
   optional peak normalization. PCM and FLAC cannot store peaks above 0 dBFS, so those files are turned
   down to the chosen peak level instead of being clipped again.
@@ -35,8 +44,16 @@ colors and resolution, for the whole file and up close at the peaks the restorat
   a zip, or have them saved to a folder. Results are named like the command line names them,
   `song [auto clip normal].wav`.
 
-Keyboard shortcuts: **B** / **A** / **D** for before / after / delta, **F** / **S** for the full length /
-snippets tab, **←** / **→** for the previous / next snippet.
+Keys (they are also shown on the controls they work):
+
+| Key | |
+|---|---|
+| **B** / **A** / **D** | before / after / delta |
+| **1** ... **9** | the first nine results (remove results you no longer need to reach later ones) |
+| **F** / **S** | full length / snippets |
+| **←** / **→** | previous / next snippet |
+| **Space** | play / pause the view on screen |
+| **Shift** + click | play from there (also Ctrl + click; in Snippets a plain click does it) |
 
 ## Installation
 
@@ -69,14 +86,20 @@ From a clone: `pip install -e .`, then `betterdeclipper-gui` or `python -m bette
 
 ### Google Colab
 
-Pick a GPU runtime (*Runtime > Change runtime type*), then run:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Qupci/BetterDeclipperGUI/blob/main/BetterDeclipperGUI.ipynb)
+
+Open [`BetterDeclipperGUI.ipynb`](BetterDeclipperGUI.ipynb) in Colab (it asks for the free T4 GPU), run
+**Start BetterDeclipper** and open the `gradio.live` link it prints. To work with files in your Google Drive,
+run **Connect Google Drive** first: then the Batch tab's folder field and *Also save to folder* take Drive
+folders such as `/content/drive/MyDrive/Music`, so a whole folder can be declipped and saved back to Drive.
+Anyone with the link can use the app while it runs, so keep it to yourself.
+
+By hand, in any notebook with a GPU runtime (Colab already has the CUDA build of torch):
 
 ```
 !pip install https://github.com/Qupci/BetterDeclipperGUI/archive/refs/heads/main.zip
 !betterdeclipper-gui --share
 ```
-
-and open the `gradio.live` link it prints. Colab already has the CUDA build of torch.
 
 ## Options
 

@@ -4,7 +4,8 @@ current view. Gradio-free, so it can be scripted and tested on its own.
 Results are kept on disk as 32-bit float WAV (the raw restoration, before any output gain), next to a
 float copy of the input when the input format cannot be read at arbitrary positions (MP3, Ogg); views
 read only the samples they show. The snippet list is ranked from the first result that restored
-anything and then stays put, so later results with other settings are compared at the same places.
+anything and then stays put, so later results with other settings are compared at the same places (a
+moment picked before that result stays on view).
 """
 import os
 import shutil
@@ -18,7 +19,7 @@ import numpy as np
 import soundfile as sf
 
 from . import render as R
-from .processing import db, declip_array, output_gain, output_name, report_lines, write_audio
+from .processing import Cancelled, db, declip_array, output_gain, output_name, report_lines, write_audio
 from .snippets import VIEW_S, RestorationMap, Snippet, rank
 
 SEEKABLE = {"WAV", "WAVEX", "AIFF", "FLAC", "W64", "RF64", "CAF"}  # sample-exact random access
@@ -53,6 +54,10 @@ def parse_time(text):
     if t < 0:
         raise ValueError(f"not a time: {text!r}")
     return t
+
+
+def same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def read_segment(path, a, b, frames, C):
@@ -173,6 +178,8 @@ class Session:
         self._dir = None
         self._clips = []
         self.tab = "full"         # sub-tab on view: 'full' (full length) or 'snip' (snippets)
+        self.loads = 0            # inputs loaded so far (tells the players a new file from a new version)
+        self.had = set()          # the files loaded since the input was last cleared
         self._reset()
 
     def __deepcopy__(self, memo):  # gr.State deep-copies its value; a session is one live object
@@ -214,32 +221,64 @@ class Session:
             self._dir = None
 
     def load(self, path):
-        """Open a new input (the results of the previous one are discarded). Until a result restores
-        something, the view shows the input's own peak."""
+        """Open a new input (the results of the previous one are discarded; a run of it stops at its next
+        step). Until a result restores something, the view shows the input's own peak, in full length."""
         with self.lock:
             shutil.rmtree(self.single_dir, ignore_errors=True)
             self._reset()
+            self.loads += 1
             inp = self.input = open_input(path, self.single_dir)
             self.snippets = [Snippet(inp.peak_pos, inp.peak_ch, inp.peak, inp.peak, fallback=True)]
             self.channel = inp.peak_ch
+            self.tab = "full"
+            self.had.add(os.path.normcase(os.path.abspath(path)))
             return inp
+
+    def load_if_new(self, path):
+        """load(path) unless it is the input already: the new InputFile, or None. The upload event and
+        Declip (pressed during the upload) can both get here first; the other one waits and gets None."""
+        with self.lock:
+            if self.input is not None and same_file(self.input.path, path):
+                return None
+            return self.load(path)
+
+    def take(self, path):
+        """The input of a run that was asked for with `path`: 'ok' if it is the input, 'loaded' if it was
+        loaded now (Declip came before the upload event), 'stale' if the input changed since (path is an
+        earlier input: the run waited in the queue)."""
+        with self.lock:
+            if self.input is not None and same_file(self.input.path, path):
+                return "ok"
+            if os.path.normcase(os.path.abspath(path)) in self.had:
+                return "stale"
+            self.load(path)
+            return "loaded"
 
     def clear(self):
         with self.lock:
             shutil.rmtree(self.single_dir, ignore_errors=True)
             self._reset()
+            self.had.clear()
 
     # ---- results --------------------------------------------------------------------------------
     def process(self, settings, progress=None):
-        """Declip the input with these settings; the result is appended to the history and selected."""
+        """Declip the input with these settings; the result is appended to the history and selected.
+        Raises Cancelled when Stop was pressed or another file was loaded meanwhile."""
         inp = self.input
         if inp is None:
             raise ValueError("no input")
+
+        def step(i, n, el):
+            if self.input is not inp:
+                raise Cancelled()
+            if progress:
+                progress(i, n, el)
+
         y, sr = sf.read(inp.path, dtype="float64", always_2d=True)
-        x, info, label = declip_array(y, sr, settings, progress, self.cancel)
+        x, info, label = declip_array(y, sr, settings, step, self.cancel)
         with self.lock:
-            if self.input is not inp:  # a new file was loaded meanwhile
-                raise ValueError("the input changed while processing")
+            if self.input is not inp:
+                raise Cancelled()
             rid = self.next_id
             self.next_id += 1
         raw = os.path.join(self.single_dir, f"run{rid}", output_name(inp.stem, label, settings.preset, "wav32f"))
@@ -250,11 +289,12 @@ class Session:
         del x, y
         with self.lock:
             if self.input is not inp:
-                raise ValueError("the input changed while processing")
+                raise Cancelled()
             self.runs.append(run)
             self.selected = rid
             if not self.snippets or (self.snippets[0].fallback and run.rmap.restored):
-                self.rank_from(run)
+                # the first restoring result ranks the snippets; a moment picked by hand stays on view
+                self.rank_from(run, keep_view=self.custom is not None)
         return run
 
     def run(self, rid=None):
@@ -312,14 +352,17 @@ class Session:
         return path, note
 
     # ---- snippets -------------------------------------------------------------------------------
-    def rank_from(self, run):
+    def rank_from(self, run, keep_view=False):
+        """Rank the snippets by this result and show the first one (keep_view: stay on the moment on view)."""
         with self.lock:
             inp = self.input
             sn = rank(run.rmap, inp.sr)
             if not sn:  # nothing restored: look at the input's peak
                 sn = [Snippet(inp.peak_pos, inp.peak_ch, inp.peak, inp.peak, fallback=True)]
-            self.snippets, self.snip_idx, self.custom = sn, 0, None
-            self.channel = sn[0].channel
+            self.snippets, self.snip_idx = sn, 0
+            if not keep_view:
+                self.custom = None
+                self.channel = sn[0].channel
 
     def goto(self, i):
         with self.lock:
@@ -425,9 +468,9 @@ class Session:
                              info=info, title_color=R.VIEW_COLORS[view])
 
     def snippet_audio(self, view):
-        """WAV of the view (all channels) for listening. All versions share one gain, turned down by the
-        highest peak of all results when it exceeds 0 dBFS, so they compare at their true levels and nothing
-        clips."""
+        """(WAV path, start, length) of the view (all channels) for listening. All versions share one gain,
+        turned down by the highest peak of all results when it exceeds 0 dBFS, so they compare at their true
+        levels and nothing clips."""
         with self.lock:
             inp, run, peak = self.input, self.run(), self.peak_ref()
             start, n = self.region()
@@ -450,7 +493,7 @@ class Session:
             old, self._clips = self._clips[:-6], self._clips[-6:]
         for p in old:
             shutil.rmtree(p, ignore_errors=True)
-        return path
+        return path, start, n
 
     # ---- full length ----------------------------------------------------------------------------
     def _reader(self, view, run, ch):
@@ -545,6 +588,25 @@ class Session:
         for p in old:
             shutil.rmtree(os.path.dirname(p), ignore_errors=True)
         return path
+
+    def player(self, kind, view):
+        """What a player plays, the full length (kind 'full') or the snippet ('snip') of a view: {path, name,
+        label, note, tl, file, t0, dur, dl}. tl names the timeline (other views of it play from the same
+        position), file the input; t0 and dur are in seconds."""
+        with self.lock:
+            inp, run, loads = self.input, self.run(), self.loads
+            gain_db = self.playback_gain_db()
+        v = view if run is not None else "Before"
+        if kind == "full":
+            path, start, n = self.full_audio(v), 0, inp.frames
+            what, tl = "Full length", str(loads)
+        else:
+            path, start, n = self.snippet_audio(v)
+            what, tl = "Snippet", f"{loads}:{start}:{n}"
+        which = "Before · the input" if v == "Before" else f"{v} · {run.name}"
+        note = f"played at {gain_db:+.1f} dB, so the restored peaks don't clip" if gain_db < -0.05 else ""
+        return {"path": path, "name": os.path.basename(path), "label": f"{what} · {which}", "note": note,
+                "tl": tl, "file": str(loads), "t0": start / inp.sr, "dur": n / inp.sr, "dl": kind == "snip"}
 
     def goto_x(self, x):
         """A click on the overview at column x: the snippet whose flag is there, else that moment."""

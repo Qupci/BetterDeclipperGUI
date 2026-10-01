@@ -2,16 +2,20 @@
 delta at its most restored peaks, or declip many files at once."""
 import argparse
 import atexit
+import json
+import mimetypes
 import os
 import shutil
 import sys
 import time
+import urllib.parse
 import zipfile
 
 import gradio as gr
 import numpy as np
 import pandas as pd
 import soundfile as sf
+from gradio.route_utils import API_PREFIX
 from gradio.utils import get_upload_folder
 
 from . import __version__
@@ -19,6 +23,10 @@ from . import render as R
 from .processing import (AUDIO_EXTS, PRESETS, Cancelled, Output, Settings, db, declip_array,
                          device_description, list_audio, output_gain, output_name, write_audio)
 from .session import Session, channel_names, parse_time, remove_work_dirs
+
+# the players load the WAVs straight from the work folder (Gradio serves its upload folder): as audio/wav,
+# which some systems' MIME tables call audio/x-wav, and Gradio would serve as a download then
+mimetypes.add_type("audio/wav", ".wav")
 
 WORK_ROOT = os.path.join(get_upload_folder(), "betterdeclipper_gui")
 SESSION_ROOT = os.path.join(WORK_ROOT, str(os.getpid()))  # sessions end with the process
@@ -46,25 +54,47 @@ FORMAT_CHOICES = [
 FORMAT_INFO = "32-bit float keeps restored peaks above 0 dBFS as they are."
 BATCH_HEADERS = ["File", "Restoration", "Samples restored", "Peak", "Output", "Time"]
 
-IDLE = "Upload an audio file, then press **Declip**."
+IDLE = ("Upload an audio file, then press **Declip** (on the left, under the settings). It can be pressed "
+        "while the file is still uploading.")
 VIEW_HELP = ("**Before**: the input · **After**: the result, orange where it goes beyond the input · "
              "**Delta**: after - before, what was added. All waveforms share one scale, set by the highest "
-             "peak of all results. Keys: **B** / **A** / **D** view, **F** / **S** tab, **←** / **→** snippet.")
-OVERVIEW_HELP = ("Click anywhere to look at that moment in **Snippets**; the numbered flags are the most "
-                 "restored peaks (1 = most) and the light band is the snippet on view.")
+             "peak of all results.")
+KEYS_HELP = ("<kbd>B</kbd> <kbd>A</kbd> <kbd>D</kbd> view &nbsp;·&nbsp; <kbd>1</kbd> … <kbd>9</kbd> result "
+             "&nbsp;·&nbsp; <kbd>F</kbd> <kbd>S</kbd> tab &nbsp;·&nbsp; <kbd>←</kbd> <kbd>→</kbd> snippet "
+             "&nbsp;·&nbsp; <kbd>Space</kbd> play / pause &nbsp;·&nbsp; <kbd>Shift</kbd> + click: play from there")
+OVERVIEW_HELP = ("Click a moment to look at it in **Snippets**, <kbd>Shift</kbd> + click (or <kbd>Ctrl</kbd> + "
+                 "click) to play from there. The numbered flags are the most restored peaks (1 = most), the "
+                 "light band is the snippet on view.")
+SNIP_HELP = "Click the view to play from there."
+KEYS_NOTE = ("Keys <kbd>1</kbd> … <kbd>9</kbd> pick the first nine results: remove the ones you no longer need "
+             "to reach the others.")
+RESULTS_LABEL = "Results: pick one to view and download it"
 
 HELP = """
 ### Getting started
-1. Upload a clipped file (WAV, FLAC, AIFF, MP3, Ogg) on the **Declip** tab and press **Declip**.
+1. Upload a clipped file (WAV, FLAC, AIFF, MP3, Ogg) on the **Declip** tab, check the settings on the left
+   and press **Declip** under them. It can be pressed while the file is still uploading: the file is
+   declipped as soon as it is there, with the settings as they are then.
 2. **Full length** shows the whole result: the numbered flags mark the most restored peaks. Click one, or any
    other moment, to look at it closely in **Snippets**, which shows 3 seconds centered on that peak.
    Switch **Before / After / Delta**, the channel and the frequency scale; step through the peaks with
-   **◀ ▶**, or type a time (`1:23.5`).
+   **◀ ▶**, or type a time (`1:23.5`). A moment picked before the first result stays on view.
 3. Try other settings and press **Declip** again: every run is kept under **Results**, and the view stays
    at the same place, so you can compare them. Remove results you don't need; the waveform scale follows
    the highest peak of the results that are left.
-4. Listen to the whole result or to the snippet, download the selected result (in the output format
-   chosen on the left), or declip many files on the **Batch** tab.
+4. Listen: **Space** plays and pauses the view on screen. Playback carries on when you switch between
+   before, after and delta or between results, so you hear the difference at the same moment. Download the
+   selected result (in the output format chosen on the left), or declip many files on the **Batch** tab.
+
+### Keys
+| Key | |
+|---|---|
+| <kbd>B</kbd> <kbd>A</kbd> <kbd>D</kbd> | before / after / delta |
+| <kbd>1</kbd> … <kbd>9</kbd> | the first nine results (remove results you no longer need to reach later ones) |
+| <kbd>F</kbd> <kbd>S</kbd> | full length / snippets |
+| <kbd>←</kbd> <kbd>→</kbd> | previous / next snippet |
+| <kbd>Space</kbd> | play / pause |
+| <kbd>Shift</kbd> + click | play from there (also <kbd>Ctrl</kbd> + click; in Snippets a plain click) |
 
 ### Settings
 - **Preset**: `fast` is quickest, `normal` a good default, `high` and `best` a little more accurate and
@@ -83,53 +113,28 @@ The waveform (top) is drawn like in iZotope RX, with a dB scale; the red line ma
 peaks exceed it. The spectrogram matches RX's default look: its colors (black at -120 dB to white at
 0 dB), its log frequency axis, and its resolution (in the log view, RX's multi-resolution at FFT size 512).
 Clipping shows up as a haze of distortion between the harmonics and as vertical smears at the peaks; a good
-restoration clears them. Both players play the current view at one common gain (turned down only when the
-highest peak exceeds 0 dBFS), so the versions compare fairly and nothing clips.
+restoration clears them. Both players play at one common gain (turned down only when the highest peak
+exceeds 0 dBFS), so the versions compare fairly and nothing clips; the white line is the playhead.
 """
 
-CSS = """
-#bd-report textarea { font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; font-size: 12px; line-height: 1.35; }
-.bd-dim { opacity: 0.65; font-size: 0.92em; }
-#bd-help-line { font-size: 0.88em; opacity: 0.8; }
-#bd-image img, #bd-overview img { image-rendering: auto; }
-#bd-overview img { cursor: crosshair; }
-#bd-toolbar { align-items: center; }
-"""
+WEB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
-# Keyboard shortcuts for quick A/B comparisons (ignored while typing in a text field).
-HEAD = """
-<script>
-document.addEventListener('keydown', (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
-  const t = e.target, tag = t && t.tagName;
-  const typing = tag === 'TEXTAREA' || (t && t.isContentEditable) ||
-                 (tag === 'INPUT' && !['radio', 'checkbox', 'button'].includes(t.type));
-  if (typing) return;
-  const pick = (value) => {
-    const el = document.querySelector(`#bd-view input[type="radio"][value="${value}"]`);
-    if (el && !el.checked) { el.click(); }
-    if (el) e.preventDefault();
-  };
-  const press = (id) => {
-    const b = document.getElementById(id);
-    if (b && tag !== 'INPUT') { b.click(); e.preventDefault(); }
-  };
-  const tab = (label) => {
-    const b = [...document.querySelectorAll('button[role="tab"]')].find((x) => x.textContent.trim() === label);
-    if (b) { b.click(); e.preventDefault(); }
-  };
-  switch (e.key) {
-    case 'b': case 'B': pick('Before'); break;
-    case 'a': case 'A': pick('After'); break;
-    case 'd': case 'D': pick('Delta'); break;
-    case 'f': case 'F': tab('Full length'); break;
-    case 's': case 'S': tab('Snippets'); break;
-    case 'ArrowLeft': press('bd-prev'); break;
-    case 'ArrowRight': press('bd-next'); break;
-  }
-});
-</script>
-"""
+
+def _web(name):
+    with open(os.path.join(WEB, name), encoding="utf-8") as f:
+        return f.read()
+
+
+CSS = _web("app.css")
+PLAYER_HTML = _web("player.html")
+# the browser side (web/app.js), told where the plot area of the rendered views is
+HEAD = (f"<script>window.BD_LAYOUT = {json.dumps({'plotW': R.PLOT_W, 'top': R.WAVE_Y, 'bottom': R.TIME_Y})};"
+        f"</script>\n<script>\n{_web('app.js')}\n</script>\n")
+MOUNT_PLAYER = "if (window.bdMountPlayer) window.bdMountPlayer(element, props, watch);"
+# Declip: tell on_run_start whether the input is still uploading, then wait for it in the browser
+UPLOADING_JS = "(...a) => { a[a.length - 1] = !!(window.bdUploading && window.bdUploading()); return a; }"
+WAIT_UPLOAD_JS = "async () => { if (window.bdWaitForUpload) await window.bdWaitForUpload(); }"
+STOP_WAIT_JS = "(...a) => { window.bdStopWait = true; return a; }"
 
 
 def _pid_alive(pid):
@@ -199,9 +204,23 @@ def _summary(run, note):
     return msg + (f"  \nDownload: {note}." if note else "")
 
 
-def _player_label(s, name):
-    g = s.playback_gain_db()
-    return name + (f" (played at {g:+.1f} dB so the restored peaks don't clip)" if g < -0.05 else "")
+def _player_value(info):
+    """A player's value: what it plays (Session.player) with the URL of the file, as JSON."""
+    if info is None:
+        return ""
+    d = dict(info)
+    d["src"] = f"{API_PREFIX}/file=" + urllib.parse.quote(d.pop("path"), safe="/")
+    return json.dumps(d)
+
+
+def _unreadable(e):
+    return f"Could not read this file ({e}). WAV, FLAC, AIFF, MP3, Ogg and Opus files work."
+
+
+def _player(pid, elem_id):
+    """A player (see web/app.js): its value is a _player_value."""
+    return gr.HTML("", html_template=PLAYER_HTML, js_on_load=MOUNT_PLAYER, apply_default_css=False,
+                   elem_id=elem_id, pid=pid)
 
 
 def build(folders=True):
@@ -209,13 +228,15 @@ def build(folders=True):
     import betterdeclipper
     dev, dev_name = device_description()
     header = (f"# BetterDeclipper\n"
-              f"Restores clipped, limited and lossy-encoded peaks. Upload a file and press **Declip**, then "
-              f"look at the whole result and compare *before*, *after* and *delta* at the most restored peaks.  \n"
+              f"Restores clipped, limited and lossy-encoded peaks. Upload a file and press **Declip** (on the "
+              f"left, under the settings), then look at the whole result and compare *before*, *after* and "
+              f"*delta* at the most restored peaks.  \n"
               f"<span class='bd-dim'>core {betterdeclipper.__version__} · GUI {__version__} · {dev_name}</span>")
 
     # no telemetry or version check (they phone home, and hold the process open when offline)
     with gr.Blocks(title="BetterDeclipper", delete_cache=(3600, 86400), analytics_enabled=False) as demo:
         sess = gr.State(lambda: Session(SESSION_ROOT), delete_callback=Session.close)
+        uploading = gr.Checkbox(False, visible=False)  # filled in by the browser when Declip is pressed
 
         with gr.Sidebar(open=True, width=330):
             gr.Markdown("### Restoration")
@@ -231,6 +252,13 @@ def build(folders=True):
                                      info="Restored samples stay within this much of the clip level.")
                 device = gr.Radio(["auto", "cuda", "cpu"] if dev == "cuda" else ["auto", "cpu"], value="auto",
                                   label="Device")
+            # the action sits right under the settings it uses: Declip, or Declip all on the Batch tab
+            with gr.Column() as run_group:
+                run_btn = gr.Button("Declip", variant="primary", size="lg")
+                stop_btn = gr.Button("Stop", variant="stop", visible=False)
+            with gr.Column(visible=False) as batch_group:
+                batch_btn = gr.Button("Declip all", variant="primary", size="lg")
+                batch_stop = gr.Button("Stop after this step", variant="stop", visible=False)
             gr.Markdown("### Output")
             fmt = gr.Dropdown(FORMAT_CHOICES, value="wav32f", label="Format", info=FORMAT_INFO)
             normalize = gr.Checkbox(False, label="Normalize the peak")
@@ -241,22 +269,21 @@ def build(folders=True):
 
         gr.Markdown(header)
         # render_children: hidden tabs stay mounted, so switching tabs keeps everything as it was
-        with gr.Tabs():
+        with gr.Tabs() as main_tabs:
             # ---- single file --------------------------------------------------------------------
-            with gr.Tab("Declip", render_children=True):
+            with gr.Tab("Declip", id="declip", render_children=True):
                 with gr.Row(equal_height=False):
                     inp = gr.Audio(label="Input", sources=["upload"], type="filepath", format=None,
-                                   editable=False, scale=3)
+                                   editable=False, scale=3, elem_id="bd-input")
                     with gr.Column(scale=1, min_width=250):
-                        run_btn = gr.Button("Declip", variant="primary", size="lg", interactive=False)
-                        stop_btn = gr.Button("Stop", variant="stop", visible=False)
                         inp_info = gr.Markdown(IDLE)
                         status = gr.Markdown("", min_height=72)  # run summary; the progress bar shows here
                 with gr.Row(visible=False, equal_height=False) as results_row:
                     with gr.Column(scale=3):
-                        history = gr.Radio([], label="Results: pick one to view and download it")
-                        with gr.Row():
+                        history = gr.Radio([], label=RESULTS_LABEL, elem_id="bd-history")
+                        with gr.Row(equal_height=True):
                             remove_btn = gr.Button("Remove this result", size="sm", scale=0, min_width=160)
+                            keys_note = gr.Markdown(KEYS_NOTE, visible=False, elem_classes=["bd-dim"])
                     with gr.Column(scale=1, min_width=250):
                         download = gr.File(label="Download", interactive=False)
                         dl_note = gr.Markdown(elem_classes=["bd-dim"])
@@ -267,48 +294,53 @@ def build(folders=True):
                         chan = gr.Radio(["L", "R"], value="L", show_label=False, container=False, scale=1)
                         scale = gr.Radio(SCALES, value="Log", show_label=False, container=False, scale=1)
                     gr.Markdown(VIEW_HELP, elem_id="bd-help-line")
-                    with gr.Tabs(selected="full") as subtabs:
+                    gr.Markdown(KEYS_HELP, elem_id="bd-keys")
+                    with gr.Tabs(selected="full", elem_id="bd-subtabs") as subtabs:
                         with gr.Tab("Full length", id="full", render_children=True):
                             ov_image = gr.Image(type="numpy", format="png", show_label=False, interactive=False,
                                                 buttons=["download", "fullscreen"], elem_id="bd-overview")
                             gr.Markdown(OVERVIEW_HELP, elem_classes=["bd-dim"])
-                            ov_audio = gr.Audio(label="Full length", type="filepath", interactive=False, buttons=[])
+                            ov_player = _player("full", "bd-player-full")
                         with gr.Tab("Snippets", id="snip", render_children=True):
                             image = gr.Image(type="numpy", format="png", show_label=False, interactive=False,
                                              buttons=["download", "fullscreen"], elem_id="bd-image")
                             with gr.Row(equal_height=True):
-                                prev_btn = gr.Button("◀ Prev", size="sm", scale=0, min_width=84, elem_id="bd-prev")
+                                prev_btn = gr.Button("◀ Prev", size="sm", scale=0, min_width=100, elem_id="bd-prev")
                                 snip = gr.Dropdown([], show_label=False, container=False, scale=5)
-                                next_btn = gr.Button("Next ▶", size="sm", scale=0, min_width=84, elem_id="bd-next")
+                                next_btn = gr.Button("Next ▶", size="sm", scale=0, min_width=100, elem_id="bd-next")
                                 goto = gr.Textbox(show_label=False, container=False,
                                                   placeholder="go to time, e.g. 1:23.5", scale=2, min_width=150)
                                 rerank_btn = gr.Button("Re-rank peaks from this result", size="sm", scale=1,
                                                        min_width=150, visible=False)
-                            clip_audio = gr.Audio(label="This snippet", type="filepath", interactive=False,
-                                                  buttons=["download"])
+                            gr.Markdown(SNIP_HELP, elem_classes=["bd-dim"])
+                            clip_player = _player("snip", "bd-player-snip")
                     with gr.Accordion("Analysis: what the declipper found", open=False, visible=False) as report_box:
                         report = gr.Textbox(label="Analysis", lines=10, max_lines=40, elem_id="bd-report",
                                             buttons=["copy"], interactive=False)
 
             # ---- batch --------------------------------------------------------------------------
-            with gr.Tab("Batch", render_children=True):
-                gr.Markdown("Declip many files with the settings on the left. Results are named like the "
-                            "command line names them, e.g. `song [auto clip normal].wav`.")
+            with gr.Tab("Batch", id="batch", render_children=True):
+                gr.Markdown("Declip many files with the settings on the left: press **Declip all** under them. "
+                            "Results are named like the command line names them, e.g. "
+                            "`song [auto clip normal].wav`.")
                 batch_files = gr.File(label="Audio files", file_count="multiple", type="filepath",
                                       file_types=list(AUDIO_EXTS))
                 batch_folder = gr.Textbox(label="... and/or every audio file in this folder", visible=folders,
                                           placeholder="e.g. D:\\Music\\to declip",
                                           info="Results go next to the files, or to 'Also save to folder'.")
-                with gr.Row():
-                    batch_btn = gr.Button("Declip all", variant="primary")
-                    batch_stop = gr.Button("Stop after this step", variant="stop", visible=False)
                 batch_status = gr.Markdown(min_height=72)
                 batch_table = gr.Dataframe(headers=BATCH_HEADERS, interactive=False, visible=False, wrap=True)
                 batch_zip = gr.File(label="All results (.zip)", visible=False, interactive=False)
                 batch_out = gr.File(label="Results", file_count="multiple", visible=False, interactive=False)
 
-            with gr.Tab("Help", render_children=True):
+            with gr.Tab("Help", id="help", render_children=True):
                 gr.Markdown(HELP)
+
+        def on_main_tab(evt: gr.SelectData):
+            batch = evt.value == "Batch" or evt.index == 1
+            return gr.update(visible=not batch), gr.update(visible=batch)
+
+        main_tabs.select(on_main_tab, None, [run_group, batch_group], queue=False, show_progress="hidden")
 
         # ---- helpers ----------------------------------------------------------------------------
         def output_of(fmt_v, norm_v, target_v, folder_v):
@@ -326,14 +358,14 @@ def build(folders=True):
                     d[ov_image] = s.render_overview(view_v, sc)
                     s.shown["ov_img"] = keys["ov_img"]
                 if s.shown.get("ov_audio") != keys["ov_audio"]:
-                    d[ov_audio] = gr.update(value=s.full_audio(view_v), label=_player_label(s, "Full length"))
+                    d[ov_player] = _player_value(s.player("full", view_v))
                     s.shown["ov_audio"] = keys["ov_audio"]
             else:
                 if s.shown.get("sn_img") != keys["sn_img"]:
                     d[image] = s.render(view_v, sc)
                     s.shown["sn_img"] = keys["sn_img"]
                 if s.shown.get("sn_audio") != keys["sn_audio"]:
-                    d[clip_audio] = gr.update(value=s.snippet_audio(view_v), label=_player_label(s, "This snippet"))
+                    d[clip_player] = _player_value(s.player("snip", view_v))
                     s.shown["sn_audio"] = keys["sn_audio"]
             if full:
                 names = channel_names(s.input.channels)
@@ -342,11 +374,18 @@ def build(folders=True):
                 d[snip] = gr.update(choices=choices, value=value)
                 hist, sel = s.history()
                 d[history] = gr.update(choices=hist, value=sel)
+                d[keys_note] = gr.update(visible=len(hist) > 9)
                 run = s.run()
                 d[report] = run.report if run else ""
                 d[report_box] = gr.update(visible=run is not None)
                 d[rerank_btn] = gr.update(visible=run is not None and len(s.runs) > 1)
             return d
+
+        def loaded(s):
+            """Updates for a file just loaded: what it is, no results yet, the full length on view."""
+            return {inp_info: s.input.describe(), status: "", view: "Before",
+                    results_row: gr.update(visible=False), viewer_col: gr.update(visible=True),
+                    subtabs: gr.Tabs(selected="full"), clip_player: ""}
 
         def download_of(s, out):
             run = s.run()
@@ -355,54 +394,81 @@ def build(folders=True):
             path, note = s.export(run.id, out)
             return {download: path, dl_note: note}
 
-        media = [ov_image, ov_audio, image, clip_audio]
-        view_out = media + [chan, snip, history, report, report_box, rerank_btn]
+        media = [ov_image, ov_player, image, clip_player]
+        view_out = media + [chan, snip, history, keys_note, report, report_box, rerank_btn]
+        load_out = [inp_info, status, results_row, viewer_col, view, subtabs]
         out_inputs = [fmt, normalize, target, folder]
-        hidden = lambda: {status: "", results_row: gr.update(visible=False), viewer_col: gr.update(visible=False)}
+        hidden = lambda: {status: "", results_row: gr.update(visible=False), viewer_col: gr.update(visible=False),
+                          ov_player: "", clip_player: ""}
+        quiet = dict(show_progress="minimal", show_progress_on=[ov_image, image])  # no spinner on the players
 
         # ---- single file: input and runs --------------------------------------------------------
         def on_upload(s, path, scale_v):
             if not path:
                 return gr.skip()
-            if s.input is not None and os.path.abspath(path) == os.path.abspath(s.input.path):
-                return gr.skip()  # the file that is already loaded (its results stay)
-            s.cancel.set()  # a run of the previous input stops at its next step (Declip clears this)
             try:
-                inp_file = s.load(path)
+                inp_file = s.load_if_new(path)
             except Exception as e:  # unreadable / unsupported file
                 s.clear()
-                return {inp_info: f"Could not read this file ({e}). WAV, FLAC, AIFF, MP3, Ogg and Opus files work.",
-                        run_btn: gr.update(interactive=False), **hidden()}
+                return {inp_info: _unreadable(e), **hidden()}
+            if inp_file is None:
+                return gr.skip()  # loaded already (Declip, pressed during the upload, can get here first)
             d = viewer(s, "Before", scale_v)
-            d.update({inp_info: inp_file.describe(), status: "", run_btn: gr.update(interactive=True),
-                      view: "Before", results_row: gr.update(visible=False), viewer_col: gr.update(visible=True)})
+            d.update(loaded(s))
+            with s.lock:
+                if s.input is not inp_file or s.runs:  # a result came first (a tiny file): keep its view
+                    s.shown.clear()
+                    return gr.skip()
             return d
 
         def on_clear(s):
-            s.cancel.set()
+            s.cancel.set()  # a run of it stops at its next step, a waiting one does not start
             s.clear()
-            return {inp_info: IDLE, run_btn: gr.update(interactive=False), **hidden()}
+            return {inp_info: IDLE, **hidden()}
 
         # upload / clear only: they fire on what the user does, not when the component is shown again
-        inp.upload(on_upload, [sess, inp, scale],
-                   [inp_info, status, run_btn, results_row, viewer_col, view] + view_out)
-        inp.clear(on_clear, sess, [inp_info, status, run_btn, results_row, viewer_col])
+        inp.upload(on_upload, [sess, inp, scale], load_out + view_out)
+        inp.clear(on_clear, sess, [inp_info, status, results_row, viewer_col, ov_player, clip_player])
 
-        def on_run_start(s):
+        def on_run_start(s, busy):
             s.cancel.clear()
-            return gr.update(visible=False), gr.update(visible=True), ""
+            msg = ("Waiting for the upload to finish: the file is declipped as soon as it is there, with the "
+                   "settings as they are then." if busy else "")
+            return gr.update(visible=False), gr.update(visible=True), msg
 
-        def on_run(s, preset_v, mode_v, clip_v, knee_v, gain_v, device_v, fmt_v, norm_v, target_v, folder_v,
+        def on_run(s, path, preset_v, mode_v, clip_v, knee_v, gain_v, device_v, fmt_v, norm_v, target_v, folder_v,
                    scale_v, progress=gr.Progress()):
-            if s.input is None:
-                raise gr.Error("Upload an audio file first.")
             st = _settings(preset_v, mode_v, clip_v, knee_v, gain_v, device_v)
             out = output_of(fmt_v, norm_v, target_v, folder_v)
+            if s.cancel.is_set():  # Stop, or the input was cleared, while it waited
+                yield {status: "Stopped."}
+                return
+            if path:
+                try:
+                    got = s.take(path)  # waits while the upload event loads it
+                except Exception as e:
+                    s.clear()
+                    yield {inp_info: _unreadable(e), **hidden()}
+                    return
+                if got == "stale":
+                    yield {status: "The input changed while this run waited: press **Declip** again."}
+                    return
+                if got == "loaded":  # pressed during the upload, and here before the upload event
+                    d = viewer(s, "Before", scale_v)
+                    d.update(loaded(s))
+                    yield d
+            if s.input is None:
+                raise gr.Error("Upload an audio file first.")
+            if s.cancel.is_set():
+                yield {status: "Stopped."}
+                return
             progress(0, desc="Analyzing the clipping")
             try:
                 run = s.process(st, lambda i, n, el: progress((i, n), desc="Declipping", unit="steps"))
             except Cancelled:
-                return {status: "Stopped."}
+                if s.cancel.is_set():
+                    yield {status: "Stopped."}
+                return  # else another file was loaded meanwhile, and is on view
             except Exception as e:
                 raise gr.Error(f"Declipping failed: {e}")
             d = viewer(s, "After", scale_v)
@@ -416,18 +482,24 @@ def build(folders=True):
                     msg += f"  \nSaved to `{dst}`."
                 except OSError as e:
                     msg += f"  \nCould not save to the folder: {e}"
-            d.update({status: msg, results_row: gr.update(visible=True), view: "After"})
-            return d
+            d.update({status: msg, inp_info: s.input.describe(), results_row: gr.update(visible=True),
+                      viewer_col: gr.update(visible=True), view: "After"})
+            yield d
 
         def on_run_end():
             return gr.update(visible=True), gr.update(visible=False)
 
-        run_btn.click(on_run_start, sess, [run_btn, stop_btn, status], queue=False).then(
-            on_run, [sess, preset, mode, clip, knee, max_gain, device] + out_inputs + [scale],
-            [status, results_row, download, dl_note, view] + view_out,
-            concurrency_id="declip", concurrency_limit=1, show_progress_on=[status]).then(
-            on_run_end, None, [run_btn, stop_btn], queue=False)
-        stop_btn.click(lambda s: s.cancel.set(), sess, None, queue=False)
+        # Declip can be pressed while the input uploads: the browser waits for the upload, then the run reads
+        # the settings (so it uses them as they are when it starts)
+        running = run_btn.click(on_run_start, [sess, uploading], [run_btn, stop_btn, status], js=UPLOADING_JS,
+                                queue=False).then(
+            None, None, None, js=WAIT_UPLOAD_JS).then(
+            on_run, [sess, inp, preset, mode, clip, knee, max_gain, device] + out_inputs + [scale],
+            load_out + [download, dl_note] + view_out,
+            concurrency_id="declip", concurrency_limit=1, show_progress_on=[status])
+        for after in (running.then, running.failure):  # .then does not follow an error
+            after(on_run_end, None, [run_btn, stop_btn], queue=False)
+        stop_btn.click(lambda s: s.cancel.set(), sess, None, js=STOP_WAIT_JS, queue=False)
 
         def on_history(s, rid, view_v, scale_v, *out_v):
             s.select(rid)
@@ -438,7 +510,7 @@ def build(folders=True):
             return d
 
         history.input(on_history, [sess, history, view, scale] + out_inputs,
-                      [view, download, dl_note] + view_out, show_progress="minimal")
+                      [view, download, dl_note] + view_out, **quiet)
 
         def on_remove(s, view_v, scale_v, *out_v):
             if s.run() is None:
@@ -455,7 +527,7 @@ def build(folders=True):
             return d
 
         remove_btn.click(on_remove, [sess, view, scale] + out_inputs,
-                         [results_row, view, status, download, dl_note] + view_out)
+                         [results_row, view, status, download, dl_note] + view_out, **quiet)
 
         def on_output(s, *out_v):
             if s.input is None or s.run() is None:
@@ -473,8 +545,8 @@ def build(folders=True):
                 gr.Info("Press Declip first: there is no result to show yet.")
             return viewer(s, view_v, scale_v, full=False) or gr.skip()
 
-        view.input(on_view, [sess, view, scale], media, show_progress="minimal")
-        scale.input(on_view, [sess, view, scale], media, show_progress="minimal")
+        view.input(on_view, [sess, view, scale], media, **quiet)
+        scale.input(on_view, [sess, view, scale], media, **quiet)
 
         def on_chan(s, name, view_v, scale_v):
             if s.input is None:
@@ -484,7 +556,7 @@ def build(folders=True):
                 s.channel = names.index(name) if name in names else 0
             return viewer(s, view_v, scale_v, full=False) or gr.skip()
 
-        chan.input(on_chan, [sess, chan, view, scale], media, show_progress="minimal")
+        chan.input(on_chan, [sess, chan, view, scale], media, **quiet)
 
         def on_subtab(s, view_v, scale_v, evt: gr.SelectData):
             s.tab = "snip" if evt.value == "Snippets" or evt.index == 1 else "full"
@@ -493,7 +565,7 @@ def build(folders=True):
             return viewer(s, view_v, scale_v, full=False) or gr.skip()
 
         # the Tabs' select event (a Tab's own select event only fires on its first selection)
-        subtabs.select(on_subtab, [sess, view, scale], media, show_progress="minimal")
+        subtabs.select(on_subtab, [sess, view, scale], media, **quiet)
 
         def on_overview_click(s, view_v, scale_v, evt: gr.SelectData):
             if s.input is None or not evt.index or evt.index[0] >= R.PLOT_W:
@@ -504,7 +576,7 @@ def build(folders=True):
             d[subtabs] = gr.Tabs(selected="snip")
             return d
 
-        ov_image.select(on_overview_click, [sess, view, scale], [subtabs] + view_out, show_progress="minimal")
+        ov_image.select(on_overview_click, [sess, view, scale], [subtabs] + view_out, **quiet)
 
         def on_step(step):
             def fn(s, view_v, scale_v):
@@ -514,8 +586,8 @@ def build(folders=True):
                 return viewer(s, view_v, scale_v)
             return fn
 
-        prev_btn.click(on_step(-1), [sess, view, scale], view_out, show_progress="minimal")
-        next_btn.click(on_step(+1), [sess, view, scale], view_out, show_progress="minimal")
+        prev_btn.click(on_step(-1), [sess, view, scale], view_out, **quiet)
+        next_btn.click(on_step(+1), [sess, view, scale], view_out, **quiet)
 
         def on_snip(s, value, view_v, scale_v):
             if s.input is None or value in (None, "custom"):
@@ -523,7 +595,7 @@ def build(folders=True):
             s.goto(int(value))
             return viewer(s, view_v, scale_v)
 
-        snip.input(on_snip, [sess, snip, view, scale], view_out, show_progress="minimal")
+        snip.input(on_snip, [sess, snip, view, scale], view_out, **quiet)
 
         def on_goto(s, text, view_v, scale_v):
             if s.input is None or not (text or "").strip():
@@ -538,7 +610,7 @@ def build(folders=True):
             s.goto_time(t)
             return viewer(s, view_v, scale_v)
 
-        goto.submit(on_goto, [sess, goto, view, scale], view_out, show_progress="minimal")
+        goto.submit(on_goto, [sess, goto, view, scale], view_out, **quiet)
 
         def on_rerank(s, view_v, scale_v):
             run = s.run()
@@ -547,7 +619,7 @@ def build(folders=True):
             s.rank_from(run)
             return viewer(s, view_v, scale_v)
 
-        rerank_btn.click(on_rerank, [sess, view, scale], view_out, show_progress="minimal")
+        rerank_btn.click(on_rerank, [sess, view, scale], view_out, **quiet)
 
         # ---- batch ------------------------------------------------------------------------------
         def on_batch_start(s):
@@ -633,11 +705,12 @@ def build(folders=True):
         def on_batch_end():
             return gr.update(visible=True), gr.update(visible=False)
 
-        batch_btn.click(on_batch_start, sess, [batch_btn, batch_stop], queue=False).then(
+        batching = batch_btn.click(on_batch_start, sess, [batch_btn, batch_stop], queue=False).then(
             on_batch, [sess, batch_files, batch_folder, preset, mode, clip, knee, max_gain, device] + out_inputs,
             [batch_status, batch_table, batch_zip, batch_out],
-            concurrency_id="declip", concurrency_limit=1, show_progress_on=[batch_status]).then(
-            on_batch_end, None, [batch_btn, batch_stop], queue=False)
+            concurrency_id="declip", concurrency_limit=1, show_progress_on=[batch_status])
+        for after in (batching.then, batching.failure):
+            after(on_batch_end, None, [batch_btn, batch_stop], queue=False)
         batch_stop.click(lambda s: s.cancel_batch.set(), sess, None, queue=False)
 
     return demo

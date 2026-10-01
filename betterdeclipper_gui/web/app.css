@@ -1,0 +1,104 @@
+#bd-report textarea { font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace; font-size: 12px; line-height: 1.35; }
+.bd-dim { opacity: 0.65; font-size: 0.92em; }
+#bd-help-line { font-size: 0.88em; opacity: 0.8; }
+#bd-image img, #bd-overview img { image-rendering: auto; }
+#bd-overview img { cursor: crosshair; }
+#bd-image img { cursor: pointer; }
+#bd-toolbar { align-items: center; }
+#bd-overview, #bd-image { position: relative; }
+
+/* keys: keycaps on the controls they work, and in the help lines */
+.gradio-container kbd,
+#bd-view input + span::after,
+#bd-subtabs button[role="tab"]::before,
+#bd-prev::after, #bd-next::after,
+#bd-history label:nth-child(-n+9) > span::before {
+  display: inline-block;
+  box-sizing: border-box;
+  min-width: 1.75em;
+  padding: 0 0.4em;
+  border: 1px solid var(--border-color-primary);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  background: var(--background-fill-secondary);
+  color: var(--body-text-color);
+  font: 600 0.78rem/1.5 ui-monospace, 'Cascadia Mono', Consolas, monospace;
+  text-align: center;
+  vertical-align: 0.06em;
+}
+#bd-view input + span::after,
+#bd-subtabs button[role="tab"]::before,
+#bd-prev::after, #bd-next::after { margin-left: 0.55em; }
+/* (a tab's ::after is its selection underline; a flex item, the ::before can follow the label) */
+#bd-subtabs button[role="tab"]::before { order: 1; }
+#bd-view input[value="Before"] + span::after { content: "B"; }
+#bd-view input[value="After"] + span::after { content: "A"; }
+#bd-view input[value="Delta"] + span::after { content: "D"; }
+#bd-subtabs button[data-tab-id="full"]::before { content: "F"; }
+#bd-subtabs button[data-tab-id="snip"]::before { content: "S"; }
+#bd-prev::after { content: "\2190"; }
+#bd-next::after { content: "\2192"; }
+#bd-history { counter-reset: bd-result; }
+#bd-history label { counter-increment: bd-result; }
+#bd-history label:nth-child(-n+9) > span::before { content: counter(bd-result); margin-right: 0.6em; }
+#bd-keys { font-size: 0.9em; line-height: 2; }
+#bd-keys kbd { margin: 0 0.1em; }
+
+/* the players */
+.bd-player {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-color-primary);
+  border-radius: var(--block-radius, 8px);
+  background: var(--block-background-fill);
+  color: var(--body-text-color);
+}
+.bd-player.bd-empty { opacity: 0.55; }
+.bd-player.bd-empty .bd-play, .bd-player.bd-empty .bd-seek { pointer-events: none; }
+.bd-play {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--button-primary-background-fill);
+  color: var(--button-primary-text-color);
+  cursor: pointer;
+}
+.bd-play:hover { background: var(--button-primary-background-fill-hover); }
+.bd-play svg { width: 18px; height: 18px; }
+.bd-play .bd-i-pause, .bd-playing .bd-play .bd-i-play { display: none; }
+.bd-playing .bd-play .bd-i-pause { display: block; }
+.bd-mid { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.bd-row { display: flex; align-items: baseline; gap: 12px; font-size: 0.86rem; }
+.bd-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.bd-time { flex: none; font: 0.84rem ui-monospace, 'Cascadia Mono', Consolas, monospace; opacity: 0.85; }
+.bd-seek { width: 100%; margin: 2px 0; accent-color: var(--color-accent); cursor: pointer; }
+.bd-note { font-size: 0.78rem; opacity: 0.65; }
+.bd-note:empty { display: none; }
+.bd-player kbd { flex: none; }
+.bd-dl {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  color: var(--body-text-color-subdued);
+}
+.bd-dl:hover { background: var(--background-fill-secondary); color: var(--body-text-color); }
+.bd-dl[hidden] { display: none; }
+.bd-playhead {
+  position: absolute;
+  width: 2px;
+  margin-left: -1px;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+  pointer-events: none;
+  z-index: 3;
+}

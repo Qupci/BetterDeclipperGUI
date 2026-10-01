@@ -40,3 +40,6 @@ version = { attr = "betterdeclipper_gui.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["betterdeclipper_gui*"]
+
+[tool.setuptools.package-data]
+betterdeclipper_gui = ["web/*"]  # the browser side: script, styles, the player's markup
