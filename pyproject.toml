@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ dynamic = ["version"]
 description = "Web interface for BetterDeclipper: declip audio, compare before / after / delta in an RX-style view, batch processing"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "GPL-3.0-only"  # like the declipper it builds on
+license-files = ["LICENSE"]
 authors = [{ name = "Qupci" }]
 keywords = ["audio", "declipping", "declipper", "restoration", "clipping", "gui", "gradio"]
 classifiers = [

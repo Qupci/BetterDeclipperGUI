@@ -5,7 +5,8 @@ Results are kept on disk as 32-bit float WAV (the raw restoration, before any ou
 float copy of the input when the input format cannot be read at arbitrary positions (MP3, Ogg); views
 read only the samples they show. The snippet list is ranked from the first result that restored
 anything and then stays put, so later results with other settings are compared at the same places (a
-moment picked before that result stays on view).
+moment picked before that result stays on view). The declipper's analysis of the input is kept too: later
+runs with other presets or modes only repeat the restoration.
 """
 import os
 import shutil
@@ -19,7 +20,8 @@ import numpy as np
 import soundfile as sf
 
 from . import render as R
-from .processing import Cancelled, db, declip_array, output_gain, output_name, report_lines, write_audio
+from .processing import (Cancelled, db, declip_array, output_gain, output_name, report_lines, reuses_analysis,
+                         write_audio)
 from .snippets import VIEW_S, RestorationMap, Snippet, rank
 
 SEEKABLE = {"WAV", "WAVEX", "AIFF", "FLAC", "W64", "RF64", "CAF"}  # sample-exact random access
@@ -158,6 +160,7 @@ class Run:
     flagged: float      # fraction of samples restored
     report: str
     rmap: RestorationMap
+    reused: bool = False  # the analysis of an earlier run was reused
     exports: dict = field(default_factory=dict)
 
     @property
@@ -187,6 +190,7 @@ class Session:
 
     def _reset(self):
         self.input = None
+        self.analysis = None      # the declipper's analysis of the input (info['analysis']['data'])
         self.runs = []
         self.next_id = 1
         self.snippets = []
@@ -261,9 +265,14 @@ class Session:
             self.had.clear()
 
     # ---- results --------------------------------------------------------------------------------
+    def will_reuse_analysis(self, settings):
+        """Will a run with these settings reuse the analysis of an earlier run (and skip analyzing)?"""
+        return self.analysis is not None and reuses_analysis(settings)
+
     def process(self, settings, progress=None):
-        """Declip the input with these settings; the result is appended to the history and selected.
-        Raises Cancelled when Stop was pressed or another file was loaded meanwhile."""
+        """Declip the input with these settings; the result is appended to the history and selected. The
+        input's analysis is made once and reused by later runs where it applies. Raises Cancelled when Stop
+        was pressed or another file was loaded meanwhile."""
         inp = self.input
         if inp is None:
             raise ValueError("no input")
@@ -275,17 +284,21 @@ class Session:
                 progress(i, n, el)
 
         y, sr = sf.read(inp.path, dtype="float64", always_2d=True)
-        x, info, label = declip_array(y, sr, settings, step, self.cancel)
+        x, info, label = declip_array(y, sr, settings, step, self.cancel, analysis=self.analysis)
         with self.lock:
             if self.input is not inp:
                 raise Cancelled()
+            data = (info.get("analysis") or {}).get("data")
+            if data is not None:
+                self.analysis = data
             rid = self.next_id
             self.next_id += 1
         raw = os.path.join(self.single_dir, f"run{rid}", output_name(inp.stem, label, settings.preset, "wav32f"))
         write_audio(x, sr, raw, "wav32f")
         run = Run(rid, settings.preset, settings.mode, label, raw, float(np.abs(x).max()), info["time"],
                   info.get("device", "cpu"), info["clipped_frac"],
-                  "\n".join(report_lines(info, y.shape[1], settings.preset)), RestorationMap(y, x, sr))
+                  "\n".join(report_lines(info, y.shape[1], settings.preset)), RestorationMap(y, x, sr),
+                  reused=info.get("reused_analysis", False))
         del x, y
         with self.lock:
             if self.input is not inp:

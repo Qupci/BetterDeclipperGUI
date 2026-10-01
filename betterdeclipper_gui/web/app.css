@@ -7,43 +7,6 @@
 #bd-toolbar { align-items: center; }
 #bd-overview, #bd-image { position: relative; }
 
-/* keys: keycaps on the controls they work, and in the help lines */
-.gradio-container kbd,
-#bd-view input + span::after,
-#bd-subtabs button[role="tab"]::before,
-#bd-prev::after, #bd-next::after,
-#bd-history label:nth-child(-n+9) > span::before {
-  display: inline-block;
-  box-sizing: border-box;
-  min-width: 1.75em;
-  padding: 0 0.4em;
-  border: 1px solid var(--border-color-primary);
-  border-bottom-width: 2px;
-  border-radius: 5px;
-  background: var(--background-fill-secondary);
-  color: var(--body-text-color);
-  font: 600 0.78rem/1.5 ui-monospace, 'Cascadia Mono', Consolas, monospace;
-  text-align: center;
-  vertical-align: 0.06em;
-}
-#bd-view input + span::after,
-#bd-subtabs button[role="tab"]::before,
-#bd-prev::after, #bd-next::after { margin-left: 0.55em; }
-/* (a tab's ::after is its selection underline; a flex item, the ::before can follow the label) */
-#bd-subtabs button[role="tab"]::before { order: 1; }
-#bd-view input[value="Before"] + span::after { content: "B"; }
-#bd-view input[value="After"] + span::after { content: "A"; }
-#bd-view input[value="Delta"] + span::after { content: "D"; }
-#bd-subtabs button[data-tab-id="full"]::before { content: "F"; }
-#bd-subtabs button[data-tab-id="snip"]::before { content: "S"; }
-#bd-prev::after { content: "\2190"; }
-#bd-next::after { content: "\2192"; }
-#bd-history { counter-reset: bd-result; }
-#bd-history label { counter-increment: bd-result; }
-#bd-history label:nth-child(-n+9) > span::before { content: counter(bd-result); margin-right: 0.6em; }
-#bd-keys { font-size: 0.9em; line-height: 2; }
-#bd-keys kbd { margin: 0 0.1em; }
-
 /* the players */
 .bd-player {
   display: flex;
@@ -81,7 +44,6 @@
 .bd-seek { width: 100%; margin: 2px 0; accent-color: var(--color-accent); cursor: pointer; }
 .bd-note { font-size: 0.78rem; opacity: 0.65; }
 .bd-note:empty { display: none; }
-.bd-player kbd { flex: none; }
 .bd-dl {
   flex: none;
   display: grid;

@@ -43,9 +43,19 @@ if errorlevel 1 goto failed
 
 :havetorch
 echo.
+rem pip keeps an installed declipper as it is: when updating, get its latest version as well
+set "UPDATE="
+"%PY%" -m pip show betterdeclipper >nul 2>nul && set "UPDATE=1"
 echo Installing BetterDeclipper and the GUI ...
 "%PY%" -m pip install -e .
 if errorlevel 1 goto failed
+if not defined UPDATE goto installed
+echo.
+echo Updating BetterDeclipper to its latest version ...
+"%PY%" -m pip install --force-reinstall --no-deps "betterdeclipper @ https://github.com/Qupci/BetterDeclipper/archive/refs/heads/main.zip"
+if errorlevel 1 goto failed
+
+:installed
 echo.
 echo Done. Start the app with run.bat
 pause

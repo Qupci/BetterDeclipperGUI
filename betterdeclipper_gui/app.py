@@ -58,16 +58,14 @@ IDLE = ("Upload an audio file, then press **Declip** (on the left, under the set
         "while the file is still uploading.")
 VIEW_HELP = ("**Before**: the input · **After**: the result, orange where it goes beyond the input · "
              "**Delta**: after - before, what was added. All waveforms share one scale, set by the highest "
-             "peak of all results.")
-KEYS_HELP = ("<kbd>B</kbd> <kbd>A</kbd> <kbd>D</kbd> view &nbsp;·&nbsp; <kbd>1</kbd> … <kbd>9</kbd> result "
-             "&nbsp;·&nbsp; <kbd>F</kbd> <kbd>S</kbd> tab &nbsp;·&nbsp; <kbd>←</kbd> <kbd>→</kbd> snippet "
-             "&nbsp;·&nbsp; <kbd>Space</kbd> play / pause &nbsp;·&nbsp; <kbd>Shift</kbd> + click: play from there")
-OVERVIEW_HELP = ("Click a moment to look at it in **Snippets**, <kbd>Shift</kbd> + click (or <kbd>Ctrl</kbd> + "
-                 "click) to play from there. The numbered flags are the most restored peaks (1 = most), the "
-                 "light band is the snippet on view.")
+             "peak of all results. Keys: **B** / **A** / **D** view, **1** - **9** result, **F** / **S** tab, "
+             "**←** / **→** snippet, **Space** play / pause, **Shift** + click play from there.")
+OVERVIEW_HELP = ("Click a moment to look at it in **Snippets**, **Shift** + click (or **Ctrl** + click) to play "
+                 "from there. The numbered flags are the most restored peaks (1 = most), the light band is the "
+                 "snippet on view.")
 SNIP_HELP = "Click the view to play from there."
-KEYS_NOTE = ("Keys <kbd>1</kbd> … <kbd>9</kbd> pick the first nine results: remove the ones you no longer need "
-             "to reach the others.")
+KEYS_NOTE = ("Keys **1** - **9** pick the first nine results: remove the ones you no longer need to reach the "
+             "others.")
 RESULTS_LABEL = "Results: pick one to view and download it"
 
 HELP = """
@@ -80,21 +78,20 @@ HELP = """
    Switch **Before / After / Delta**, the channel and the frequency scale; step through the peaks with
    **◀ ▶**, or type a time (`1:23.5`). A moment picked before the first result stays on view.
 3. Try other settings and press **Declip** again: every run is kept under **Results**, and the view stays
-   at the same place, so you can compare them. Remove results you don't need; the waveform scale follows
-   the highest peak of the results that are left.
+   at the same place, so you can compare them. The file is analyzed once: later runs with another preset or
+   mode only repeat the restoration. Remove results you don't need; the waveform scale follows the highest
+   peak of the results that are left.
 4. Listen: **Space** plays and pauses the view on screen. Playback carries on when you switch between
    before, after and delta or between results, so you hear the difference at the same moment. Download the
    selected result (in the output format chosen on the left), or declip many files on the **Batch** tab.
 
 ### Keys
-| Key | |
-|---|---|
-| <kbd>B</kbd> <kbd>A</kbd> <kbd>D</kbd> | before / after / delta |
-| <kbd>1</kbd> … <kbd>9</kbd> | the first nine results (remove results you no longer need to reach later ones) |
-| <kbd>F</kbd> <kbd>S</kbd> | full length / snippets |
-| <kbd>←</kbd> <kbd>→</kbd> | previous / next snippet |
-| <kbd>Space</kbd> | play / pause |
-| <kbd>Shift</kbd> + click | play from there (also <kbd>Ctrl</kbd> + click; in Snippets a plain click) |
+- **B** / **A** / **D**: before / after / delta
+- **1** - **9**: the first nine results (remove results you no longer need to reach later ones)
+- **F** / **S**: full length / snippets
+- **←** / **→**: previous / next snippet
+- **Space**: play / pause
+- **Shift** + click: play from there (also **Ctrl** + click; in Snippets a plain click)
 
 ### Settings
 - **Preset**: `fast` is quickest, `normal` a good default, `high` and `best` a little more accurate and
@@ -176,13 +173,36 @@ def cleanup_stale(root=WORK_ROOT, age_s=STALE_S):
             pass
 
 
+class BadSetting(ValueError):
+    """An Advanced setting that can't be used; the message says which one and why."""
+
+
+def _number(text, what):
+    """An optional number typed in a text field: None when empty ('off'), else the value. A comma decimal,
+    a typographic minus and a trailing dB / dBFS are fine."""
+    t = (text or "").strip().lower().replace("−", "-").replace(",", ".")
+    for unit in ("dbfs", "db"):
+        t = t[:-len(unit)].strip() if t.endswith(unit) else t
+    if t in ("", "off", "none"):
+        return None
+    try:
+        return float(t)
+    except ValueError:
+        raise BadSetting(f"{what} (Advanced) is '{text.strip()}': type a number, e.g. -12, or leave it empty.")
+
+
 def _settings(preset, mode, clip, knee, max_gain, device):
-    for v, what in ((clip, "clip level"), (knee, "knee")):
+    """Settings from the sidebar. The optional Advanced values are text fields: empty means off (Gradio's
+    number fields turn empty into 0 when they first show, which forced a clip level of 0 dBFS)."""
+    clip_db, knee_db = _number(clip, "Force clip level"), _number(knee, "Force soft knee")
+    gain_db = _number(max_gain, "Gain cap")
+    for v, what in ((clip_db, "Force clip level"), (knee_db, "Force soft knee")):
         if v is not None and v >= 0:
-            raise gr.Error(f"The forced {what} must be below 0 dBFS (for example -12).")
-    if max_gain is not None and max_gain < 0:
-        raise gr.Error("The gain cap must be 0 dB or more.")
-    return Settings(preset, mode, clip, knee, max_gain, device)
+            raise BadSetting(f"{what} (Advanced) is {v:g} dBFS: it must be below 0 dBFS, e.g. -12, or empty to "
+                             f"let the analysis decide.")
+    if gain_db is not None and gain_db <= 0:
+        raise BadSetting(f"Gain cap (Advanced) is {gain_db:g} dB: it must be above 0 dB, or empty for no cap.")
+    return Settings(preset, mode, clip_db, knee_db, gain_db, device)
 
 
 def _unique(path, taken):
@@ -199,7 +219,8 @@ def _unique(path, taken):
 def _summary(run, note):
     what = (f"{run.flagged * 100:.1f} % of the samples restored" if run.flagged
             else "nothing to restore, see the analysis below")
-    msg = (f"**Result #{run.id}** in {run.seconds:.1f} s ({run.device}): *{run.label}*, {what}, "
+    how = run.device + (", the analysis reused" if run.reused else "")
+    msg = (f"**Result #{run.id}** in {run.seconds:.1f} s ({how}): *{run.label}*, {what}, "
            f"peak {db(run.peak):+.2f} dBFS.")
     return msg + (f"  \nDownload: {note}." if note else "")
 
@@ -243,13 +264,14 @@ def build(folders=True):
             preset = gr.Radio(list(PRESETS), value="normal", label="Preset",
                               info="fast = quickest, normal = good default, high / best = a little better, slower")
             mode = gr.Dropdown(MODE_CHOICES, value="auto", label="Mode", info=MODE_INFO)
-            with gr.Accordion("Advanced", open=False):
-                clip = gr.Number(None, label="Force clip level (dBFS)", placeholder="e.g. -12",
-                                 info="Skips the analysis and restores only above this level (hard mode).")
-                knee = gr.Number(None, label="Force soft knee (dBFS)", placeholder="e.g. -9",
-                                 info="Skips the analysis; every sample above it may only grow (soft mode).")
-                max_gain = gr.Number(None, label="Gain cap (dB)", placeholder="off", minimum=0,
-                                     info="Restored samples stay within this much of the clip level.")
+            with gr.Accordion("Advanced", open=False) as advanced:
+                # text fields: empty = off (see _settings)
+                clip = gr.Textbox(label="Force clip level (dBFS)", placeholder="off, e.g. -12", max_lines=1,
+                                  info="Skips the analysis and restores only above this level (hard mode).")
+                knee = gr.Textbox(label="Force soft knee (dBFS)", placeholder="off, e.g. -9", max_lines=1,
+                                  info="Skips the analysis; every sample above it may only grow (soft mode).")
+                max_gain = gr.Textbox(label="Gain cap (dB)", placeholder="off, e.g. 12", max_lines=1,
+                                      info="Restored samples stay within this much of the clip level.")
                 device = gr.Radio(["auto", "cuda", "cpu"] if dev == "cuda" else ["auto", "cpu"], value="auto",
                                   label="Device")
             # the action sits right under the settings it uses: Declip, or Declip all on the Batch tab
@@ -294,7 +316,6 @@ def build(folders=True):
                         chan = gr.Radio(["L", "R"], value="L", show_label=False, container=False, scale=1)
                         scale = gr.Radio(SCALES, value="Log", show_label=False, container=False, scale=1)
                     gr.Markdown(VIEW_HELP, elem_id="bd-help-line")
-                    gr.Markdown(KEYS_HELP, elem_id="bd-keys")
                     with gr.Tabs(selected="full", elem_id="bd-subtabs") as subtabs:
                         with gr.Tab("Full length", id="full", render_children=True):
                             ov_image = gr.Image(type="numpy", format="png", show_label=False, interactive=False,
@@ -305,9 +326,9 @@ def build(folders=True):
                             image = gr.Image(type="numpy", format="png", show_label=False, interactive=False,
                                              buttons=["download", "fullscreen"], elem_id="bd-image")
                             with gr.Row(equal_height=True):
-                                prev_btn = gr.Button("◀ Prev", size="sm", scale=0, min_width=100, elem_id="bd-prev")
+                                prev_btn = gr.Button("◀ Prev", size="sm", scale=0, min_width=84, elem_id="bd-prev")
                                 snip = gr.Dropdown([], show_label=False, container=False, scale=5)
-                                next_btn = gr.Button("Next ▶", size="sm", scale=0, min_width=100, elem_id="bd-next")
+                                next_btn = gr.Button("Next ▶", size="sm", scale=0, min_width=84, elem_id="bd-next")
                                 goto = gr.Textbox(show_label=False, container=False,
                                                   placeholder="go to time, e.g. 1:23.5", scale=2, min_width=150)
                                 rerank_btn = gr.Button("Re-rank peaks from this result", size="sm", scale=1,
@@ -438,7 +459,12 @@ def build(folders=True):
 
         def on_run(s, path, preset_v, mode_v, clip_v, knee_v, gain_v, device_v, fmt_v, norm_v, target_v, folder_v,
                    scale_v, progress=gr.Progress()):
-            st = _settings(preset_v, mode_v, clip_v, knee_v, gain_v, device_v)
+            try:
+                st = _settings(preset_v, mode_v, clip_v, knee_v, gain_v, device_v)
+            except BadSetting as e:  # shown where it can be fixed
+                gr.Warning(str(e))
+                yield {status: f"**Not declipped.** {e}", advanced: gr.Accordion(open=True)}
+                return
             out = output_of(fmt_v, norm_v, target_v, folder_v)
             if s.cancel.is_set():  # Stop, or the input was cleared, while it waited
                 yield {status: "Stopped."}
@@ -462,7 +488,8 @@ def build(folders=True):
             if s.cancel.is_set():
                 yield {status: "Stopped."}
                 return
-            progress(0, desc="Analyzing the clipping")
+            progress(0, desc="Declipping (the analysis is reused)" if s.will_reuse_analysis(st)
+                     else "Analyzing the clipping")
             try:
                 run = s.process(st, lambda i, n, el: progress((i, n), desc="Declipping", unit="steps"))
             except Cancelled:
@@ -495,7 +522,7 @@ def build(folders=True):
                                 queue=False).then(
             None, None, None, js=WAIT_UPLOAD_JS).then(
             on_run, [sess, inp, preset, mode, clip, knee, max_gain, device] + out_inputs + [scale],
-            load_out + [download, dl_note] + view_out,
+            load_out + [download, dl_note, advanced] + view_out,
             concurrency_id="declip", concurrency_limit=1, show_progress_on=[status])
         for after in (running.then, running.failure):  # .then does not follow an error
             after(on_run_end, None, [run_btn, stop_btn], queue=False)
@@ -628,7 +655,12 @@ def build(folders=True):
 
         def on_batch(s, files, src_v, preset_v, mode_v, clip_v, knee_v, gain_v, device_v, fmt_v, norm_v,
                      target_v, folder_v, progress=gr.Progress()):
-            st = _settings(preset_v, mode_v, clip_v, knee_v, gain_v, device_v)
+            try:
+                st = _settings(preset_v, mode_v, clip_v, knee_v, gain_v, device_v)
+            except BadSetting as e:
+                gr.Warning(str(e))
+                yield {batch_status: f"**Not declipped.** {e}", advanced: gr.Accordion(open=True)}
+                return
             out = output_of(fmt_v, norm_v, target_v, folder_v)
             items = [(p, None) for p in (files or [])]      # (file, folder to write next to)
             src = (src_v or "").strip() if folders else ""
@@ -707,7 +739,7 @@ def build(folders=True):
 
         batching = batch_btn.click(on_batch_start, sess, [batch_btn, batch_stop], queue=False).then(
             on_batch, [sess, batch_files, batch_folder, preset, mode, clip, knee, max_gain, device] + out_inputs,
-            [batch_status, batch_table, batch_zip, batch_out],
+            [batch_status, batch_table, batch_zip, batch_out, advanced],
             concurrency_id="declip", concurrency_limit=1, show_progress_on=[batch_status])
         for after in (batching.then, batching.failure):
             after(on_batch_end, None, [batch_btn, batch_stop], queue=False)

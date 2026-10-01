@@ -62,9 +62,27 @@ def device_description():
     return "cpu", "CPU (no CUDA GPU found: processing takes minutes per song)"
 
 
-def declip_array(y, sr, s, progress=None, cancel=None):
+ANALYSIS_MODES = ("auto", "hard", "soft", "limiter")  # the modes a saved analysis serves
+
+
+def supports_analysis():
+    """Does the installed declipper take a saved analysis (betterdeclipper 0.3.0 on)?"""
+    import inspect
+    from betterdeclipper import declip
+    return "analysis" in inspect.signature(declip).parameters
+
+
+def reuses_analysis(s):
+    """Can a run with settings s use the analysis of an earlier run of the same input? (Forced clip levels
+    and knees skip the analysis, legacy mode has its own.)"""
+    return s.mode in ANALYSIS_MODES and s.clip_level_db is None and s.knee_db is None and supports_analysis()
+
+
+def declip_array(y, sr, s, progress=None, cancel=None, analysis=None):
     """y (T, C) float64 -> (x, info, restoration label). progress(step, n, seconds) is called after each
-    processing step; setting the `cancel` event stops at the next step (raises Cancelled)."""
+    processing step; setting the `cancel` event stops at the next step (raises Cancelled). analysis: the
+    analysis of an earlier run of y (info['analysis']['data']), used instead of analyzing it again where it
+    applies (reuses_analysis); info['reused_analysis'] tells whether it was."""
     import torch
     from betterdeclipper import declip
     from betterdeclipper.cli import restoration_label
@@ -81,6 +99,7 @@ def declip_array(y, sr, s, progress=None, cancel=None):
         kv = 10 ** (s.knee_db / 20)
         knees = [(kv, -kv)] * C
         mode, forced = "soft", "knee " + tag(kv)
+    extra = {"analysis": analysis} if analysis is not None and reuses_analysis(s) else {}
 
     def step(i, n, el):
         if cancel is not None and cancel.is_set():
@@ -96,10 +115,11 @@ def declip_array(y, sr, s, progress=None, cancel=None):
         torch.set_flush_denormal(True)
         try:
             x, info = declip(y, sr, preset=s.preset, levels=levels, knees=knees, mode=mode,
-                             max_gain_db=s.max_gain_db, device=s.device, progress=step)
+                             max_gain_db=s.max_gain_db, device=s.device, progress=step, **extra)
         finally:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+    info["reused_analysis"] = bool(extra)
     return x, info, restoration_label(mode, info, forced)
 
 

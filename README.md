@@ -28,9 +28,10 @@ No GPU, or no Python? Run it on Google Colab's free GPU with one click:
   and an h:m:s timeline. Switch between **Before** (the input), **After** (the result; what the
   restoration added is drawn in orange) and **Delta** (after - before), and between channels.
 - **Compare settings**: every run is kept in a list of results. The view stays where it is, so a run with
-  another preset or mode is compared at the same place. All waveforms share one scale, set by the highest
-  peak of all results (restored peaks often exceed 0 dBFS, a red line marks it); remove a result and the
-  scale follows the remaining ones.
+  another preset or mode is compared at the same place. The declipper's analysis of the file is made once
+  and reused, so another preset or mode only repeats the restoration (about 7 s less per run on a 75 s
+  track). All waveforms share one scale, set by the highest peak of all results (restored peaks often
+  exceed 0 dBFS, a red line marks it); remove a result and the scale follows the remaining ones.
 - **Listen** to the whole result or to the snippet on view: **Space** plays and pauses, a playhead runs
   over the view, and a click plays from a moment. Playback carries on when you switch between before,
   after and delta or between results (the new version takes over at the same moment, with a short
@@ -44,7 +45,7 @@ No GPU, or no Python? Run it on Google Colab's free GPU with one click:
   a zip, or have them saved to a folder. Results are named like the command line names them,
   `song [auto clip normal].wav`.
 
-Keys (they are also shown on the controls they work):
+Keys:
 
 | Key | |
 |---|---|
@@ -68,6 +69,8 @@ but the CPU works too.
    torch if an NVIDIA GPU is present (about 2.5 GB), else the CPU build, then the declipper and the GUI.
 4. Double-click **`run.bat`**: the app opens in your browser. Close the console window to stop it.
 
+To update the declipper to its latest version later, run `install.bat` again.
+
 ### With pip (any system)
 
 ```
@@ -80,7 +83,14 @@ Install the CUDA build of torch first, since pip otherwise pulls the CPU build a
 supports NVIDIA GPUs from the GTX 900 series on; RTX 50-series GPUs need a newer build (`cu128`, see
 [pytorch.org](https://pytorch.org/get-started/locally/)). The GUI installs the declipper
 (`betterdeclipper`) from its GitHub repository, so both the `betterdeclipper` command line tool and
-`betterdeclipper-gui` are available afterwards.
+`betterdeclipper-gui` are available afterwards. pip keeps an installed declipper as it is; to update it:
+
+```
+pip install --force-reinstall --no-deps https://github.com/Qupci/BetterDeclipper/archive/refs/heads/main.zip
+```
+
+The GUI reuses the declipper's analysis between runs from betterdeclipper 0.3.0 on (it shows its version
+under the title); with an older one every run analyzes the file again.
 
 From a clone: `pip install -e .`, then `betterdeclipper-gui` or `python -m betterdeclipper_gui`.
 
@@ -138,3 +148,9 @@ own color bar and compared pixel by pixel with renderings of the same audio.
 Bins and frames are reduced onto rows and columns by their maximum, so thin harmonics and clicks stay
 visible. Clipping shows up as a haze of distortion between the harmonics and as vertical smears at the
 peaks; a good restoration clears them, and the delta view shows what was added.
+
+## License
+
+BetterDeclipper GUI is free software, licensed under the GNU General Public License v3.0
+(`GPL-3.0-only`, see [LICENSE](LICENSE)), like
+[BetterDeclipper](https://github.com/Qupci/BetterDeclipper), which it builds on.

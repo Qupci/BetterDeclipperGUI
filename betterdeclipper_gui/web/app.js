@@ -370,6 +370,14 @@
     if (t && t.tagName === 'IMG' && t.closest && t.closest('#bd-overview, #bd-image')) placeAll();
   }, true);
 
+  /* Gradio's images load lazily: a view that got its picture while its tab was hidden (or just mounted) could
+     stay blank until another picture came. The views load at once instead. */
+  const eager = () => {
+    for (const img of document.querySelectorAll(VIEW_IMG)) if (img.loading !== 'eager') img.loading = 'eager';
+  };
+  new MutationObserver(eager).observe(document.documentElement,
+    {subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'loading']});
+
   /* called by the players' gr.HTML (js_on_load). Which player it is comes from the host's elem_id
      (bd-player-full / bd-player-snip): a component mounted by an update can get its props a moment later
      (they arrive through watch). */
