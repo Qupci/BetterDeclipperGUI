@@ -151,6 +151,5 @@ peaks; a good restoration clears them, and the delta view shows what was added.
 
 ## License
 
-BetterDeclipper GUI is free software, licensed under the GNU General Public License v3.0
-(`GPL-3.0-only`, see [LICENSE](LICENSE)), like
+BetterDeclipper GUI is licensed under the MIT License (see [LICENSE](LICENSE)), like
 [BetterDeclipper](https://github.com/Qupci/BetterDeclipper), which it builds on.
