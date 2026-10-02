@@ -185,10 +185,11 @@ def _window_plan(sr, spp, centers, scale):
             if (w > 1e-6).any()]
 
 
-def spectrogram_db(sig, pad, n_view, sr, width, height, scale="log"):
+def spectrogram_db(sig, pad, n_view, sr, width, height, scale="log", overlap=TIME_OVERLAP, zero_pad=ZERO_PAD):
     """dB image (height, width) of a snippet view, row 0 = highest frequency, 0 dB = full-scale sine.
 
-    sig: `pad` samples of context + the n_view displayed samples + `pad` samples of context."""
+    sig: `pad` samples of context + the n_view displayed samples + `pad` samples of context. overlap and
+    zero_pad: less of both is faster (the horizontal strip, where a window spans only a few columns)."""
     sig = np.asarray(sig, np.float32)
     edges, centers = _row_edges(sr, height, scale)
     spp = n_view / width
@@ -197,10 +198,10 @@ def spectrogram_db(sig, pad, n_view, sr, width, height, scale="log"):
     col_centers = 0.5 * (col_edges[:-1] + col_edges[1:])
     for n_win, rows, weights in _window_plan(sr, spp, centers, scale):
         # 16x time overlap, and at least 2 frames per column (they are max-reduced onto columns)
-        hop = int(max(1, min(n_win // TIME_OVERLAP, spp / 2)))
+        hop = int(max(1, min(n_win // overlap, spp / 2)))
         a = max(0, pad - n_win // 2 - hop)
         b = min(len(sig), pad + n_view + n_win // 2 + hop)
-        mag = _stft_rows(sig[a:b], n_win, hop, ZERO_PAD, sr, edges, centers, rows)
+        mag = _stft_rows(sig[a:b], n_win, hop, zero_pad, sr, edges, centers, rows)
         db = 20.0 * np.log10(np.maximum(mag, 1e-9))                    # (frames, rows)
         pos = a - pad + np.arange(len(db)) * hop + n_win / 2.0          # frame centers, view coordinates
         flo = np.searchsorted(pos, col_edges[:-1])
@@ -363,6 +364,93 @@ def _freq_row(f, sr, height, scale):
     return (1.0 - float(_warp(sr, scale)[0](f))) * height
 
 
+def _draw_plot(canvas, db, wave_layers, peak, width, wave_y, wave_h, spec_y, spec_h, x_of, region, span,
+               tint=0.3):
+    """The waveform (with its dB grid) and the spectrogram into canvas[:, :width], the region tinted."""
+    wave = draw_waveform(wave_layers, width, wave_h, peak)
+    for d, r in db_ticks(peak, wave_h):  # grid lines at the dB ticks (both halves), behind the waveform
+        for rr in (int(round(r)), int(round(wave_h - r))):
+            if 0 <= rr < wave_h:
+                line = wave[rr]
+                bg = np.all(line == WAVE_BG, axis=1)
+                line[bg] = ZERO_DBFS if d == 0 else GRID
+    mid = wave_h // 2
+    bg = np.all(wave[mid] == WAVE_BG, axis=1)
+    wave[mid][bg] = GRID
+    canvas[wave_y:wave_y + wave_h, :width] = wave
+    canvas[spec_y:spec_y + spec_h, :width] = colorize(db)
+    if region is not None and region[1] - region[0] < 0.9 * span:  # the snippet view's region: tinted
+        xa, xb = int(np.floor(x_of(region[0]))), int(np.ceil(x_of(region[1])))
+        xa, xb = max(xa, 0), min(max(xb, xa + 2), width)
+        if xb > xa:
+            for y0, y1 in ((wave_y, wave_y + wave_h), (spec_y, spec_y + spec_h)):
+                part = canvas[y0:y1, xa:xb].astype(np.float32)
+                canvas[y0:y1, xa:xb] = (part * (1 - tint) + 255 * tint).astype(np.uint8)
+
+
+def _draw_markers(dr, markers, x_of, width, wave_y, wave_h, keep_in=(True, True)):
+    """A numbered flag per snippet at the top of the waveform. keep_in: (left, right) keep flags at that edge
+    inside the image (a tile of a longer strip lets them run over, its neighbor draws the rest)."""
+    for t, label, on in markers:
+        x = x_of(t)
+        w = dr.textlength(label, font=FONT_SMALL) + 6
+        if not -w < x < width + w or (keep_in[0] and x < 0) or (keep_in[1] and x >= width):
+            continue
+        xl = x - w / 2
+        xl = max(xl, 0) if keep_in[0] else xl
+        xl = min(xl, width - w) if keep_in[1] else xl
+        col = MARKER_ON if on else MARKER
+        dr.line([(x, wave_y + 14), (x, wave_y + wave_h - 1)], fill=col if on else (70, 74, 84))
+        dr.rectangle([xl, wave_y + 1, xl + w, wave_y + 14], fill=col)
+        dr.text((xl + w / 2, wave_y + 8), label, fill=(15, 17, 21), font=FONT_SMALL, anchor="mm")
+
+
+def _draw_time(dr, t0, span, width, time_y, keep_in=(True, True)):
+    """The h:m:s ruler under the spectrogram; keep_in as in _draw_markers, for the labels."""
+    step = _time_step(span, width)
+    minor = step / 5
+    decimals = 3 if step < 1 else 0
+    over = 0 if all(keep_in) else 0.1 * span  # labels just outside a tile reach into it
+    k = np.ceil((t0 - over) / minor - 1e-9)
+    while True:
+        t = k * minor
+        if t > t0 + span + over + 1e-9:
+            break
+        k += 1
+        if t < 0:
+            continue
+        x = (t - t0) / span * width
+        major = abs(t / step - round(t / step)) < 1e-6
+        if 0 <= x <= width:
+            dr.line([(x, time_y), (x, time_y + (7 if major else 3))], fill=TICK)
+        if major:
+            lab = fmt_time(t, decimals)
+            w = dr.textlength(lab, font=FONT)
+            xl = max(x, w / 2 + 2) if keep_in[0] else x
+            xl = min(xl, width - w / 2 - 2) if keep_in[1] else xl
+            dr.text((xl, time_y + 9), lab, fill=TEXT_DIM, font=FONT, anchor="mt")
+
+
+def _draw_rulers(dr, x_end, peak, sr, scale, wave_y, wave_h, spec_y, spec_h):
+    """The amplitude (dB) and frequency rulers right of x_end."""
+    x0 = x_end + 6
+    for d, r in db_ticks(peak, wave_h):
+        lab = f"{d:+g}" if d > 0 else f"{d:g}"
+        for rr in (r, wave_h - r):
+            dr.line([(x_end, wave_y + rr), (x_end + 4, wave_y + rr)], fill=TICK)
+            dr.text((x0, wave_y + rr), lab, fill=TEXT if d == 0 else TEXT_DIM, font=FONT, anchor="lm")
+    dr.text((x0, wave_y + wave_h // 2), "-inf", fill=TEXT_DIM, font=FONT, anchor="lm")
+    last = -1e9
+    for f in _freq_ticks(sr, scale):
+        r = _freq_row(f, sr, spec_h, scale)
+        if r < 6 or r > spec_h - 6 or abs(r - last) < 22:
+            continue
+        last = r
+        dr.line([(x_end, spec_y + r), (x_end + 4, spec_y + r)], fill=TICK)
+        dr.text((x0, spec_y + r), _fmt_hz(f), fill=TEXT_DIM, font=FONT, anchor="lm")
+    dr.text((x_end + RULER_W - 4, spec_y + spec_h - 2), "Hz", fill=TICK, font=FONT, anchor="rb")
+
+
 def render_view(db, wave_layers, sr, t0, n_view, peak, scale="log", title="", info="", title_color=TEXT,
                 markers=(), region=None):
     """Full RGB image (HEIGHT, WIDTH, 3).
@@ -373,78 +461,55 @@ def render_view(db, wave_layers, sr, t0, n_view, peak, scale="log", title="", in
     highlighted)] flags at the top of the waveform; region: (start, end) seconds tinted over the view."""
     canvas = np.empty((HEIGHT, WIDTH, 3), np.uint8)
     canvas[:] = BG
-    wave = draw_waveform(wave_layers, PLOT_W, WAVE_H, peak)
-    ticks = db_ticks(peak, WAVE_H)
-    for d, r in ticks:  # grid lines at the dB ticks (both halves), behind the waveform
-        for rr in (int(round(r)), int(round(WAVE_H - r))):
-            if 0 <= rr < WAVE_H:
-                line = wave[rr]
-                bg = np.all(line == WAVE_BG, axis=1)
-                line[bg] = ZERO_DBFS if d == 0 else GRID
-    mid = WAVE_H // 2
-    bg = np.all(wave[mid] == WAVE_BG, axis=1)
-    wave[mid][bg] = GRID
-    canvas[WAVE_Y:WAVE_Y + WAVE_H, :PLOT_W] = wave
-    canvas[SPEC_Y:SPEC_Y + SPEC_H, :PLOT_W] = colorize(db)
     span = n_view / sr
-    to_x = lambda t: (t - t0) / span * PLOT_W
-    if region is not None and region[1] - region[0] < 0.9 * span:  # the snippet view's region: tinted
-        xa, xb = int(np.floor(to_x(region[0]))), int(np.ceil(to_x(region[1])))
-        xa, xb = max(xa, 0), min(max(xb, xa + 2), PLOT_W)
-        for y0, y1 in ((WAVE_Y, WAVE_Y + WAVE_H), (SPEC_Y, SPEC_Y + SPEC_H)):
-            part = canvas[y0:y1, xa:xb].astype(np.float32)
-            canvas[y0:y1, xa:xb] = (part * 0.7 + 255 * 0.3).astype(np.uint8)
-
+    x_of = lambda t: (t - t0) / span * PLOT_W
+    _draw_plot(canvas, db, wave_layers, peak, PLOT_W, WAVE_Y, WAVE_H, SPEC_Y, SPEC_H, x_of, region, span)
     im = Image.fromarray(canvas)
     dr = ImageDraw.Draw(im)
-    # header
     dr.text((8, HEADER_H / 2), title, fill=title_color, font=FONT_HEAD, anchor="lm")
     dr.text((HEADER_RIGHT, HEADER_H / 2), info, fill=TEXT_DIM, font=FONT_HEAD, anchor="rm")
-    # snippet markers: a numbered flag per snippet at the top of the waveform
-    for t, label, on in markers:
-        x = to_x(t)
-        if not 0 <= x < PLOT_W:
-            continue
-        w = dr.textlength(label, font=FONT_SMALL) + 6
-        xl = min(max(x - w / 2, 0), PLOT_W - w)
-        col = MARKER_ON if on else MARKER
-        dr.line([(x, WAVE_Y + 14), (x, WAVE_Y + WAVE_H - 1)], fill=col if on else (70, 74, 84))
-        dr.rectangle([xl, WAVE_Y + 1, xl + w, WAVE_Y + 14], fill=col)
-        dr.text((xl + w / 2, WAVE_Y + 8), label, fill=(15, 17, 21), font=FONT_SMALL, anchor="mm")
-    # amplitude ruler
-    x0 = PLOT_W + 6
-    for d, r in ticks:
-        lab = f"{d:+g}" if d > 0 else f"{d:g}"
-        for rr in (r, WAVE_H - r):
-            dr.line([(PLOT_W, WAVE_Y + rr), (PLOT_W + 4, WAVE_Y + rr)], fill=TICK)
-            dr.text((x0, WAVE_Y + rr), lab, fill=TEXT if d == 0 else TEXT_DIM, font=FONT, anchor="lm")
-    dr.text((x0, WAVE_Y + mid), "-inf", fill=TEXT_DIM, font=FONT, anchor="lm")
-    # frequency ruler
-    last = -1e9
-    for f in _freq_ticks(sr, scale):
-        r = _freq_row(f, sr, SPEC_H, scale)
-        if r < 6 or r > SPEC_H - 6 or abs(r - last) < 22:
-            continue
-        last = r
-        dr.line([(PLOT_W, SPEC_Y + r), (PLOT_W + 4, SPEC_Y + r)], fill=TICK)
-        dr.text((x0, SPEC_Y + r), _fmt_hz(f), fill=TEXT_DIM, font=FONT, anchor="lm")
-    dr.text((PLOT_W + RULER_W - 4, SPEC_Y + SPEC_H - 2), "Hz", fill=TICK, font=FONT, anchor="rb")
-    # time ruler
-    step = _time_step(span, PLOT_W)
-    minor = step / 5
-    decimals = 3 if step < 1 else 0
-    k = np.ceil(t0 / minor - 1e-9)
-    while True:
-        t = k * minor
-        if t > t0 + span + 1e-9:
-            break
-        x = to_x(t)
-        major = abs(t / step - round(t / step)) < 1e-6
-        dr.line([(x, TIME_Y), (x, TIME_Y + (7 if major else 3))], fill=TICK)
-        if major:
-            lab = fmt_time(t, decimals)
-            w = dr.textlength(lab, font=FONT)
-            xl = min(max(x, w / 2 + 2), PLOT_W - w / 2 - 2)
-            dr.text((xl, TIME_Y + 9), lab, fill=TEXT_DIM, font=FONT, anchor="mt")
-        k += 1
+    _draw_markers(dr, markers, x_of, PLOT_W, WAVE_Y, WAVE_H)
+    _draw_rulers(dr, PLOT_W, peak, sr, scale, WAVE_Y, WAVE_H, SPEC_Y, SPEC_H)
+    _draw_time(dr, t0, span, PLOT_W, TIME_Y)
+    return np.asarray(im)
+
+
+# ---- the horizontal strip: the whole file in tiles at a fixed zoom, its rulers beside it -----------
+STRIP_WAVE = 0.27      # share of the waveform in the strip's height (above the spectrogram)
+STRIP_TINT = 0.12      # the snippet's region, lighter than in the overview (it is much wider here)
+STRIP_OVERLAP = 4      # the strip's STFT: a window spans a few columns at most, so less overlap and zero
+STRIP_ZERO_PAD = 2     # padding look the same (frames are still max-reduced onto columns), 10x faster
+
+
+def strip_layout(height):
+    """(wave_h, spec_h) of a strip image `height` pixels high: waveform, gap, spectrogram, time ruler."""
+    rest = max(int(height) - GAP_H - TIME_H, 60)
+    wave_h = max(int(round(rest * STRIP_WAVE)), 30)
+    return wave_h, rest - wave_h
+
+
+def render_strip(db, wave_layers, sr, t0, n_view, peak, height, markers=(), region=None, first=True,
+                 last=True):
+    """One tile of the strip (height, db's width, 3): waveform, spectrogram and time ruler without a header
+    or rulers. Flags and time labels at an inner edge run over it (first / last: the strip's ends)."""
+    wave_h, spec_h = strip_layout(height)
+    width = db.shape[1]
+    canvas = np.empty((wave_h + GAP_H + spec_h + TIME_H, width, 3), np.uint8)
+    canvas[:] = BG
+    span = n_view / sr
+    x_of = lambda t: (t - t0) / span * width
+    spec_y = wave_h + GAP_H
+    _draw_plot(canvas, db, wave_layers, peak, width, 0, wave_h, spec_y, spec_h, x_of, region, span, STRIP_TINT)
+    im = Image.fromarray(canvas)
+    dr = ImageDraw.Draw(im)
+    _draw_markers(dr, markers, x_of, width, 0, wave_h, (first, last))
+    _draw_time(dr, t0, span, width, spec_y + spec_h, (first, last))
+    return np.asarray(im)
+
+
+def render_ruler(peak, sr, scale, height):
+    """The rulers (dB, Hz) of a strip `height` pixels high, as an image RULER_W wide."""
+    wave_h, spec_h = strip_layout(height)
+    im = Image.new("RGB", (RULER_W, wave_h + GAP_H + spec_h + TIME_H), BG)
+    _draw_rulers(ImageDraw.Draw(im), 0, peak, sr, scale, 0, wave_h, wave_h + GAP_H, spec_h)
     return np.asarray(im)

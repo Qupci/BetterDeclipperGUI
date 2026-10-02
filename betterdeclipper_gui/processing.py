@@ -45,9 +45,19 @@ class Settings:
 @dataclass
 class Output:
     fmt: str = "wav32f"
-    normalize: bool = False
     target_db: float = -0.1
     folder: str = ""
+    steps: int | None = None  # None: PCM / FLAC turned down to target_db if louder, never up (32-bit float kept
+                              # as it is); 0 - 4: a fixed gain of -steps x 3.01 dB, PCM / FLAC clip what still
+                              # exceeds 0 dBFS
+
+
+GAIN_STEPS = (0, 1, 2, 3, 4)
+
+
+def step_db(n):
+    """The fixed gain of n steps in dB, n x 10 log10(2) down: 0, -3.01, -6.02, -9.03, -12.04 for n = 0 ... 4."""
+    return -n * 10 * np.log10(2)
 
 
 def db(v):
@@ -141,28 +151,47 @@ def report_lines(info, C, preset):
 
 
 def output_gain(peak, out):
-    """(gain, note): normalize to the target peak if asked; integer formats (PCM WAV, FLAC) cannot hold
-    restored peaks above 0 dBFS, so they are turned down to the target instead of clipping again."""
+    """(gain, note, clips). PCM WAV and FLAC are turned down to the target peak if louder, never up (they cannot
+    hold restored peaks above 0 dBFS), or get a fixed gain (out.steps) and clip what still exceeds 0 dBFS (clips
+    True); 32-bit float is kept as it is, or gets the fixed gain."""
     if peak <= 0:
-        return 1.0, ""
-    target = 10 ** (out.target_db / 20)
-    if out.normalize:
-        g = target / peak
-        return g, f"normalized to {out.target_db:+.1f} dBFS ({db(g):+.1f} dB)"
-    if FORMATS[out.fmt][2] != "FLOAT" and peak > 1.0:
-        g = target / peak
-        return g, (f"turned down {-db(g):.1f} dB to {out.target_db:+.1f} dBFS: {FORMATS[out.fmt][0]} "
-                   f"cannot hold the restored peaks above 0 dBFS")
-    return 1.0, ""
+        return 1.0, "", False
+    integer = FORMATS[out.fmt][2] != "FLOAT"
+    if out.steps is None:
+        if not integer:
+            return 1.0, "", False
+        g = 10 ** (out.target_db / 20) / peak
+        if g >= 1.0:  # under the peak level already: left as it is
+            return 1.0, "", False
+        return g, f"turned down {-db(g):.2f} dB to {out.target_db:+.1f} dBFS", False
+    g = 10 ** (step_db(out.steps) / 20)
+    over = peak * g > 1.0
+    note = f"{step_db(out.steps):+.2f} dB" if out.steps else "0 dB"
+    if over:
+        note += (f", peak {db(peak * g):+.1f} dBFS: clipped at 0 dBFS" if integer else
+                 f", peak {db(peak * g):+.1f} dBFS kept (32-bit float)")
+    return g, note, integer and over
 
 
 def write_audio(x, sr, path, fmt, gain=1.0):
+    """Write x (times gain) in a FORMATS format; integer formats clip at 0 dBFS. Returns the number of
+    clipped samples."""
     _, container, subtype, _ = FORMATS[fmt]
     data = np.asarray(x) if gain == 1.0 else np.asarray(x) * gain
+    n_clip = 0
     if subtype == "FLOAT":
         data = data.astype(np.float32)
+    else:
+        n_clip = int(np.count_nonzero(np.abs(data) > 1.0))
+        if n_clip:
+            data = np.clip(data, -1.0, 1.0)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     sf.write(path, data, sr, format=container, subtype=subtype)
+    return n_clip
+
+
+def clip_note(n_clip, n_total):
+    return f" ({n_clip} samples, {n_clip / max(n_total, 1) * 100:.3g} %)" if n_clip else ""
 
 
 def output_name(stem, label, preset, fmt):

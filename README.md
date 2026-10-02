@@ -12,6 +12,8 @@ No GPU, or no Python? Run it on Google Colab's free GPU with one click:
 
 ![A snippet: 3 seconds at the most restored peak](docs/snippets.png)
 
+![Full length horizontal mode: 15 seconds per screen, scrolling sideways](docs/horizontal.jpg)
+
 ## What it does
 
 - **Declip** a file with the declipper's presets (`fast` ... `best`) and modes (`auto` analysis,
@@ -21,12 +23,19 @@ No GPU, or no Python? Run it on Google Colab's free GPU with one click:
   settings as they are then.
 - **Full length**: the whole result, with numbered flags at the most restored peaks. Click a flag, or any
   other moment, to look at it closely in **Snippets**; Shift+click (or Ctrl+click) plays from there instead.
+- **Full length horizontal mode** (or **H**): the whole file across the screen at 15 seconds per screen width
+  (the snippets show 3), as high as the window, scrolling sideways (scroll bar, mouse wheel, **←** / **→**).
+  It works like the full length view, with the same view, channel and scale switches; while it plays, the view
+  follows the playhead. **Esc** closes it.
 - **Snippets**: 3 s views, each centered on one of the most restored peaks (up to 10, most restored first,
   at least 5 s apart so they show different moments; the channel follows the peak). Step through them, or
   type any time (`1:23.5`). A moment picked before the first result stays on view when it comes in.
 - Both views have a waveform with a dB amplitude ruler, a spectrogram with a log or linear frequency axis,
   and an h:m:s timeline. Switch between **Before** (the input), **After** (the result; what the
-  restoration added is drawn in orange) and **Delta** (after - before), and between channels.
+  restoration added is drawn in orange) and **Delta** (after - before), and between channels. With a forced
+  clip level (Advanced), every sample at or above it counts as clipped, so that result's **Before** is the
+  input clipped at the level. That is only for viewing and listening: the declipper always gets the input as
+  it is.
 - **Compare settings**: every run is kept in a list of results. The view stays where it is, so a run with
   another preset or mode is compared at the same place. The declipper's analysis of the file is made once
   and reused, so another preset or mode only repeats the restoration (about 7 s less per run on a 75 s
@@ -38,11 +47,15 @@ No GPU, or no Python? Run it on Google Colab's free GPU with one click:
   cross-fade), so you hear the difference right away. All versions play at one common gain (turned down
   only when the highest peak of all results exceeds 0 dBFS), so their levels compare fairly and nothing
   clips.
-- **Download** as 32-bit float WAV (keeps peaks above 0 dBFS), 24/16-bit WAV or 24/16-bit FLAC, with
-  optional peak normalization. PCM and FLAC cannot store peaks above 0 dBFS, so those files are turned
-  down to the chosen peak level instead of being clipped again.
+- **Download** as 32-bit float WAV (keeps peaks above 0 dBFS), 24/16-bit WAV or 24/16-bit FLAC; the
+  download sits in the sidebar under the output settings (and next to the result list). PCM and FLAC cannot
+  store peaks above 0 dBFS, so by default (**Level**: *Turn down to the peak level*) they are turned down to
+  the chosen peak level instead of clipping them again, never turned up (32-bit float stays as restored). Or **Level** applies a
+  fixed gain of 0, -3.01, -6.02, -9.03 or -12.04 dB (n x 10 log10 2) and PCM / FLAC clip what still exceeds
+  0 dBFS.
 - **Batch**: declip many files, or every audio file in a folder, with the same settings; download them as
-  a zip, or have them saved to a folder. Results are named like the command line names them,
+  a zip, or have them saved to an output folder (set on the Batch tab or as *Also save to folder* in the
+  sidebar: they are the same). Results are named like the command line names them,
   `song [auto clip normal].wav`.
 
 Keys:
@@ -52,7 +65,8 @@ Keys:
 | **B** / **A** / **D** | before / after / delta |
 | **1** ... **9** | the first nine results (remove results you no longer need to reach later ones) |
 | **F** / **S** | full length / snippets |
-| **←** / **→** | previous / next snippet |
+| **←** / **→** | previous / next snippet (horizontal mode: scroll) |
+| **H** | full length horizontal mode (**Esc** closes it) |
 | **Space** | play / pause the view on screen |
 | **Shift** + click | play from there (also Ctrl + click; in Snippets a plain click does it) |
 

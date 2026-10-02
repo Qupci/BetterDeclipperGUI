@@ -1,10 +1,11 @@
 /* BetterDeclipper GUI, browser side: keyboard shortcuts, the two players (full length and snippet: playback
    carries on across before / after / delta and results, a playhead runs over the view, a click plays from a
-   moment) and Declip's wait for an upload in progress. window.BD_LAYOUT, set before this script, gives the
-   plot area of the rendered views. */
+   moment), the full length horizontal mode, After / Delta shown as unavailable without a result, and
+   Declip's wait for an upload in progress. window.BD_LAYOUT, set before this script, gives the plot area of
+   the rendered views. */
 (() => {
   'use strict';
-  const L = Object.assign({plotW: 1224, top: 26, bottom: 599}, window.BD_LAYOUT || {});
+  const L = Object.assign({plotW: 1224, top: 26, bottom: 599, rulerW: 58}, window.BD_LAYOUT || {});
   const VIEW_OF = {full: '#bd-overview', snip: '#bd-image'};
   const VIEW_IMG = '#bd-overview img, #bd-image img';
   const players = {};
@@ -375,8 +376,338 @@
   const eager = () => {
     for (const img of document.querySelectorAll(VIEW_IMG)) if (img.loading !== 'eager') img.loading = 'eager';
   };
-  new MutationObserver(eager).observe(document.documentElement,
-    {subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'loading']});
+
+  /* without a result, After and Delta look unavailable; picking one still says why (the server's Info) */
+  const hasResult = () => {
+    const h = document.getElementById('bd-history');
+    return !!h && shown(h) && h.querySelectorAll('input[type="radio"]').length > 0;
+  };
+  const markViews = () => {
+    const v = document.getElementById('bd-view');
+    const off = !hasResult();
+    if (v && v.classList.contains('bd-noresult') !== off) v.classList.toggle('bd-noresult', off);
+  };
+  new MutationObserver(() => {
+    eager();
+    markViews();
+  }).observe(document.documentElement,
+    {subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'loading', 'style', 'class']});
+
+  /* a command to the server (app.py on_cmd): a hidden button's event sends window.bdCmd along */
+  function command(cmd) {
+    const b = document.getElementById('bd-cmd');
+    const btn = b && (b.tagName === 'BUTTON' ? b : b.querySelector('button'));
+    if (!btn) return;
+    window.bdCmd = cmd;
+    btn.click();
+  }
+
+  /* pick a view (Before / After / Delta) as if its option was clicked */
+  function pickView(value) {
+    if (value !== 'Before' && !hasResult()) return command('noresult');
+    const el = document.querySelector(`#bd-view input[type="radio"][value="${value}"]`);
+    if (el && !el.checked) el.click();
+  }
+  document.addEventListener('click', (e) => {
+    const lab = e.target && e.target.closest ? e.target.closest('#bd-view label') : null;
+    const input = lab && lab.querySelector('input[type="radio"]');
+    if (!input || input.value === 'Before' || hasResult() || !e.isTrusted) return;
+    e.preventDefault();
+    e.stopPropagation();
+    command('noresult');
+  }, true);
+
+  // ---- full length horizontal mode -------------------------------------------------------------------
+  /* The whole file at 15 s per screen width (the server's tiles, rendered when they come near the screen),
+     scrolling sideways, with the rulers beside it. A click opens that moment in Snippets, Shift + click plays
+     from there; while the full length plays, the view follows the playhead. */
+  class Strip {
+    constructor() {
+      this.data = null;     // Session.strip_value: {sid, v, sr, frames, n, title, color, view, scale, chans, ...}
+      this.btn = null;
+      this.root = null;
+      this.isOpen = false;
+      this.geo = null;      // {W, H, v}: tile width (= screen width, 15 s) and height the tiles are made for
+      this.tiles = [];
+      this.near = new Set();  // tiles on or next to the screen
+      this.raf = 0;
+      this.userUntil = 0;   // the user scrolled: don't follow the playhead until then
+      this.resizeTimer = 0;
+    }
+
+    mount(el, props, watch) {
+      const btn = el.querySelector('.bd-strip-btn');
+      if (btn && !btn.bdBound) {
+        btn.bdBound = true;
+        btn.addEventListener('click', () => this.open());
+      }
+      this.btn = btn || this.btn;
+      if (!el.bdBound) {
+        el.bdBound = true;
+        if (watch) watch('value', () => this.update(props.value));
+      }
+      this.update(props.value);
+    }
+
+    update(json) {
+      let d = null;
+      try {
+        d = json ? JSON.parse(json) : null;
+      } catch (e) {
+        d = null;
+      }
+      this.data = d && d.sid ? d : null;
+      if (this.btn) this.btn.disabled = !this.data;
+      if (!this.isOpen) return;
+      if (!this.data) return this.close();
+      this.bar();
+      this.layout();
+    }
+
+    build() {
+      if (this.root) return;
+      const r = this.root = document.createElement('div');
+      r.className = 'bd-strip';
+      r.tabIndex = -1;
+      r.setAttribute('role', 'dialog');
+      r.setAttribute('aria-label', 'Full length horizontal mode');
+      r.innerHTML = `
+        <div class="bd-sbar">
+          <button type="button" class="bd-splay" title="Play / pause (Space)" aria-label="Play or pause">▶</button>
+          <span class="bd-stime"></span>
+          <span class="bd-stitle"></span>
+          <span class="bd-sgroup" data-k="view"><button type="button" data-v="Before">Before</button><button
+            type="button" data-v="After">After</button><button type="button" data-v="Delta">Delta</button></span>
+          <span class="bd-sgroup" data-k="chan"></span>
+          <span class="bd-sgroup" data-k="scale"><button type="button" data-v="Log">Log</button><button
+            type="button" data-v="Linear">Linear</button></span>
+          <span class="bd-shint">Click: open in Snippets · Shift + click: play from there · Space: play / pause ·
+            ← / →: scroll · Esc: close</span>
+          <button type="button" class="bd-sclose" title="Close (Esc)">✕ Close</button>
+        </div>
+        <div class="bd-sbody">
+          <div class="bd-sscroll"><div class="bd-strack"><div class="bd-shead" hidden></div></div></div>
+          <img class="bd-sruler" alt="">
+        </div>`;
+      this.scroller = r.querySelector('.bd-sscroll');
+      this.track = r.querySelector('.bd-strack');
+      this.head = r.querySelector('.bd-shead');
+      this.ruler = r.querySelector('.bd-sruler');
+      r.querySelector('.bd-sclose').addEventListener('click', () => this.close());
+      r.querySelector('.bd-splay').addEventListener('click', () => players.full && players.full.toggle());
+      r.querySelector('.bd-sbar').addEventListener('click', (e) => {
+        const b = e.target.closest('.bd-sgroup button');
+        if (!b) return;
+        const k = b.parentNode.dataset.k, v = b.dataset.v;
+        if (k === 'view') return pickView(v);
+        const el = document.querySelector(`#bd-${k} input[type="radio"][value="${v}"]`);
+        if (el && !el.checked) el.click();
+      });
+      const user = () => { this.userUntil = performance.now() + 2500; };
+      this.scroller.addEventListener('wheel', (e) => {
+        user();
+        if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;  // a sideways wheel / touchpad scrolls as it is
+        e.preventDefault();
+        this.scroller.scrollLeft += e.deltaY * (e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? this.scroller.clientWidth : 1);
+      }, {passive: false});
+      this.scroller.addEventListener('pointerdown', user);
+      this.track.addEventListener('mousedown', (e) => { if (modified(e)) e.preventDefault(); });
+      this.track.addEventListener('click', (e) => this.click(e));
+      this.io = new IntersectionObserver((entries) => {
+        for (const en of entries) {
+          const i = Number(en.target.dataset.i);
+          if (en.isIntersecting) {
+            this.near.add(i);
+            this.load(i);
+          } else {
+            this.near.delete(i);
+          }
+        }
+      }, {root: this.scroller, rootMargin: '0px 100% 0px 100%'});
+      window.addEventListener('resize', () => {
+        if (!this.isOpen) return;
+        clearTimeout(this.resizeTimer);
+        this.resizeTimer = setTimeout(() => this.layout(), 150);
+      });
+    }
+
+    open() {
+      if (!this.data || this.isOpen) return;
+      this.build();
+      if (!this.root.isConnected) document.body.appendChild(this.root);
+      this.root.hidden = false;
+      this.isOpen = true;
+      document.documentElement.classList.add('bd-strip-on');
+      this.bar();
+      const p = players.full, a = p && p.audio;
+      const region = this.data.region || [0, 0];
+      this.layout(a && p.marked ? a.currentTime : (region[0] + region[1]) / 2);
+      this.root.focus({preventScroll: true});
+      this.tick();
+    }
+
+    close() {
+      if (!this.isOpen) return;
+      this.isOpen = false;
+      this.root.hidden = true;
+      document.documentElement.classList.remove('bd-strip-on');
+      cancelAnimationFrame(this.raf);
+      this.raf = 0;
+    }
+
+    toggle() {
+      if (this.isOpen) this.close();
+      else this.open();
+    }
+
+    /* seconds per pixel and the like, for the current geometry */
+    pps() {
+      const d = this.data;
+      return this.geo.W / (d.n / d.sr);  // pixels per second
+    }
+
+    url(i) {
+      const d = this.data, g = this.geo;
+      return fileUrl(`${d.base}?sid=${d.sid}&v=${d.v}&i=${i}&w=${g.W}&h=${g.H}`);
+    }
+
+    /* (Re)build the tiles for the screen size and the data's version; `center` (seconds) is put mid-screen,
+       else the moment mid-screen stays there. */
+    layout(center) {
+      const d = this.data, sc = this.scroller;
+      const W = Math.max(200, Math.round(sc.clientWidth)), H = Math.max(200, Math.round(sc.clientHeight));
+      const old = this.geo;
+      if (center === undefined && old) center = (sc.scrollLeft + sc.clientWidth / 2) / (old.W / (d.n / d.sr));
+      this.ruler.src = fileUrl(`${d.base}?sid=${d.sid}&v=${d.v}&i=-1&h=${H}`);
+      this.ruler.style.height = `${H}px`;
+      if (old && old.W === W && old.H === H && old.frames === d.frames && old.n === d.n) {  // a new version
+        this.geo.v = d.v;
+        for (const i of this.near) this.load(i);
+        return;
+      }
+      this.geo = {W, H, v: d.v, frames: d.frames, n: d.n};
+      this.io.disconnect();
+      this.near.clear();
+      for (const t of this.tiles) t.remove();
+      this.tiles = [];
+      const count = Math.ceil(d.frames / d.n);
+      this.track.style.width = `${Math.round((d.frames / d.n) * W)}px`;
+      this.track.style.height = `${H}px`;
+      for (let i = 0; i < count; i++) {
+        const t = document.createElement('div');
+        t.className = 'bd-stile bd-sloading';
+        t.dataset.i = String(i);
+        t.style.left = `${i * W}px`;
+        t.style.width = `${Math.round((Math.min(d.n, d.frames - i * d.n) / d.n) * W)}px`;
+        t.style.height = `${H}px`;
+        const img = document.createElement('img');
+        img.alt = '';
+        img.draggable = false;
+        t.appendChild(img);
+        this.track.insertBefore(t, this.head);
+        this.tiles.push(t);
+        this.io.observe(t);
+      }
+      sc.scrollLeft = Math.max(0, (center || 0) * this.pps() - sc.clientWidth / 2);
+    }
+
+    /* show tile i of the current version (the picture on view stays until the new one is there) */
+    load(i) {
+      const t = this.tiles[i];
+      if (!t) return;
+      const url = this.url(i);
+      if (t.dataset.want === url) return;
+      t.dataset.want = url;
+      const img = new Image();
+      img.onload = () => {
+        if (t.dataset.want !== url) return;
+        t.firstChild.src = url;
+        t.classList.remove('bd-sloading');
+      };
+      img.onerror = () => {
+        if (t.dataset.want === url) t.dataset.want = '';  // retried when it comes near the screen again
+      };
+      img.src = url;
+    }
+
+    bar() {
+      const d = this.data, r = this.root;
+      if (!d || !r) return;
+      const title = r.querySelector('.bd-stitle');
+      title.textContent = d.title;
+      title.style.color = d.color;
+      const chans = r.querySelector('[data-k="chan"]');
+      if (chans.dataset.names !== d.chans.join('|')) {
+        chans.dataset.names = d.chans.join('|');
+        chans.innerHTML = '';
+        if (d.chans.length > 1) {
+          for (const c of d.chans) {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.dataset.v = c;
+            b.textContent = c;
+            chans.appendChild(b);
+          }
+        }
+      }
+      const cur = {view: d.view, chan: d.chan, scale: d.scale};
+      for (const b of r.querySelectorAll('.bd-sgroup button')) {
+        const k = b.parentNode.dataset.k;
+        b.classList.toggle('bd-on', cur[k] === b.dataset.v);
+        b.classList.toggle('bd-off', k === 'view' && b.dataset.v !== 'Before' && !d.result);
+      }
+    }
+
+    click(e) {
+      const d = this.data;
+      if (!d || !this.geo) return;
+      const x = e.clientX - this.track.getBoundingClientRect().left;
+      const t = Math.max(0, Math.min(d.frames / d.sr, x / this.pps()));
+      if (modified(e)) {
+        e.preventDefault();
+        const p = players.full;
+        if (p && p.audio) p.seekTo(t / (d.frames / d.sr), true);
+        return;
+      }
+      command(`goto:${t.toFixed(4)}:${(8 / this.pps()).toFixed(4)}`);  // a flag within 8 px is that snippet
+      this.close();
+    }
+
+    /* scroll by a share of the screen (keys) */
+    nudge(share) {
+      this.userUntil = performance.now() + 2500;
+      this.scroller.scrollBy({left: share * this.scroller.clientWidth, behavior: 'smooth'});
+    }
+
+    tick() {
+      this.raf = 0;
+      if (!this.isOpen) return;
+      const d = this.data, p = players.full, a = p && p.audio;
+      const playing = !!(a && !a.paused && !a.ended);
+      if (d && this.geo && a && p.marked) {
+        const x = Math.min(a.currentTime, d.frames / d.sr) * this.pps();
+        this.head.style.transform = `translateX(${x}px)`;
+        this.head.hidden = false;
+        const sc = this.scroller, w = sc.clientWidth;
+        if (playing && performance.now() > this.userUntil && (x > sc.scrollLeft + 0.92 * w || x < sc.scrollLeft)) {
+          sc.scrollLeft = Math.max(0, x - 0.08 * w);  // page on, as RX does
+        }
+      } else {
+        this.head.hidden = true;
+      }
+      const btn = this.root.querySelector('.bd-splay');
+      const sym = playing ? '❚❚' : '▶';
+      if (btn.textContent !== sym) btn.textContent = sym;
+      const time = this.root.querySelector('.bd-stime');
+      const txt = d ? `${fmt(a ? a.currentTime : 0)} / ${fmt(d.frames / d.sr)}` : '';
+      if (time.textContent !== txt) time.textContent = txt;
+      this.raf = requestAnimationFrame(() => this.tick());
+    }
+  }
+
+  const strip = new Strip();
+  window.bdStrip = strip;
+  window.bdMountStrip = (element, props, watch) => strip.mount(element, props, watch);
 
   /* called by the players' gr.HTML (js_on_load). Which player it is comes from the host's elem_id
      (bd-player-full / bd-player-snip): a component mounted by an update can get its props a moment later
@@ -428,6 +759,20 @@
 
   document.addEventListener('keydown', (e) => {
     if (e.ctrlKey || e.metaKey || e.altKey || typing(e.target)) return;
+    if (strip.isOpen) {  // horizontal mode: its own keys first
+      const k = e.key;
+      const own = {Escape: () => strip.close(), h: () => strip.close(), H: () => strip.close(),
+        ArrowLeft: () => strip.nudge(-0.3), ArrowRight: () => strip.nudge(0.3),
+        PageUp: () => strip.nudge(-0.9), PageDown: () => strip.nudge(0.9),
+        Home: () => strip.nudge(-1e6), End: () => strip.nudge(1e6)}[k];
+      if (own) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (!e.repeat || k.startsWith('Arrow') || k.startsWith('Page')) own();
+        return;
+      }
+      if (k === 's' || k === 'S') strip.close();  // to Snippets: the view under it
+    }
     if (e.key === ' ' || e.code === 'Space') {
       if (keyboardFocused(e.target) || !onViewer()) return;
       const p = ['full', 'snip'].map((k) => players[k]).find((q) => q && q.visible());
@@ -440,9 +785,8 @@
     if (e.repeat || !onViewer()) return;
     const inField = e.target && e.target.tagName === 'INPUT';
     const pick = (value) => {
-      const el = document.querySelector(`#bd-view input[type="radio"][value="${value}"]`);
-      if (!el) return;
-      if (!el.checked) el.click();
+      if (!document.querySelector('#bd-view input[type="radio"]')) return;
+      pickView(value);
       e.preventDefault();
     };
     const press = (id) => {
@@ -471,6 +815,12 @@
       case 'd': case 'D': pick('Delta'); break;
       case 'f': case 'F': tab('full'); break;
       case 's': case 'S': tab('snip'); break;
+      case 'h': case 'H':
+        if (shown(document.getElementById('bd-overview')) && strip.data) {
+          strip.open();
+          e.preventDefault();
+        }
+        break;
       case 'ArrowLeft': press('bd-prev'); break;
       case 'ArrowRight': press('bd-next'); break;
       default:

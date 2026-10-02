@@ -7,21 +7,27 @@ read only the samples they show. The snippet list is ranked from the first resul
 anything and then stays put, so later results with other settings are compared at the same places (a
 moment picked before that result stays on view). The declipper's analysis of the input is kept too: later
 runs with other presets or modes only repeat the restoration.
+
+A result with a forced clip level is compared with the input as the declipper saw it: every sample at or
+above that level counts as clipped (its value unknown), so its "before" is the input clipped at the level.
 """
+import io
 import os
 import shutil
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 import numpy as np
 import soundfile as sf
+from PIL import Image
 
 from . import render as R
-from .processing import (Cancelled, db, declip_array, output_gain, output_name, report_lines, reuses_analysis,
-                         write_audio)
+from .processing import (Cancelled, clip_note, db, declip_array, output_gain, output_name, report_lines,
+                         reuses_analysis, write_audio)
 from .snippets import VIEW_S, RestorationMap, Snippet, rank
 
 SEEKABLE = {"WAV", "WAVEX", "AIFF", "FLAC", "W64", "RF64", "CAF"}  # sample-exact random access
@@ -30,6 +36,11 @@ OV_CACHE = 8         # full-length spectrograms kept per session (~1 MB each)
 FULL_AUDIO_KEEP = 3  # full-length playback files kept per session (tens of MB each)
 FADE_S = 0.005       # fade in/out of the snippet audio (no clicks at the cut)
 SNAP_PX = 6          # a click on the overview this close to a snippet's flag selects that snippet
+STRIP_S = 15.0       # horizontal mode: seconds per screen width (the snippets show 3 s)
+STRIP_KEEP = 48      # horizontal mode: tiles kept per session (JPEG, ~0.5 MB each)
+
+SESSIONS = weakref.WeakValueDictionary()  # id -> Session, for the horizontal mode's tiles (app.strip_route)
+_tile_slots = threading.Semaphore(2)      # tiles rendered at once (each uses all cores for its FFTs)
 
 _created_dirs = set()  # work folders of this process (sessions end with it)
 
@@ -56,6 +67,14 @@ def parse_time(text):
     if t < 0:
         raise ValueError(f"not a time: {text!r}")
     return t
+
+
+def clip_input(y, levels):
+    """y clipped at per-channel (upper, lower) levels (None: that side not clipped)."""
+    out = y.copy()
+    for c, (hi, lo) in enumerate(levels):
+        out[:, c] = np.clip(out[:, c], -np.inf if lo is None else lo, np.inf if hi is None else hi)
+    return out
 
 
 def same_file(a, b):
@@ -161,7 +180,9 @@ class Run:
     report: str
     rmap: RestorationMap
     reused: bool = False  # the analysis of an earlier run was reused
-    exports: dict = field(default_factory=dict)
+    before_path: str | None = None  # forced clip level: the input clipped at it (float32 WAV), its "before"
+    clip_text: str = ""   # that level, e.g. '-12.0 dBFS'
+    exports: dict = field(default_factory=dict)  # (format, gain, note) -> (path, note)
 
     @property
     def name(self):
@@ -183,7 +204,12 @@ class Session:
         self.tab = "full"         # sub-tab on view: 'full' (full length) or 'snip' (snippets)
         self.loads = 0            # inputs loaded so far (tells the players a new file from a new version)
         self.had = set()          # the files loaded since the input was last cleared
+        self.ui_view = None       # the view and frequency scale the user picked last: a run that ends shows
+        self.ui_scale = None      # them, not the ones it started with
+        self.ui_picks = 0         # how often the user picked a view
+        self.strip_ver = 0        # horizontal mode: version of what it shows (see strip_value)
         self._reset()
+        SESSIONS[self.id] = self
 
     def __deepcopy__(self, memo):  # gr.State deep-copies its value; a session is one live object
         return self
@@ -204,6 +230,8 @@ class Session:
         self.full_files = OrderedDict()
         self.peaks = {}           # (result id or 0 = input, sample, channel) -> local peak
         self.shown = {}           # what each image / player on the page shows (see view_keys)
+        self.strips = OrderedDict()  # horizontal mode: version -> what it shows
+        self.tiles = OrderedDict()   # horizontal mode: (version, tile, width, height) -> JPEG
 
     # ---- files ----------------------------------------------------------------------------------
     @property
@@ -219,6 +247,7 @@ class Session:
         return os.path.join(self.dir, "single")
 
     def close(self):
+        SESSIONS.pop(self.id, None)
         if self._dir:
             shutil.rmtree(self._dir, ignore_errors=True)
             _created_dirs.discard(self._dir)
@@ -285,6 +314,9 @@ class Session:
 
         y, sr = sf.read(inp.path, dtype="float64", always_2d=True)
         x, info, label = declip_array(y, sr, settings, step, self.cancel, analysis=self.analysis)
+        forced = settings.clip_level_db is not None and settings.knee_db is None and info.get("levels")
+        if forced:  # samples at or above the level counted as clipped: compare with the input clipped there
+            y = clip_input(y, info["levels"])
         with self.lock:
             if self.input is not inp:
                 raise Cancelled()
@@ -295,10 +327,16 @@ class Session:
             self.next_id += 1
         raw = os.path.join(self.single_dir, f"run{rid}", output_name(inp.stem, label, settings.preset, "wav32f"))
         write_audio(x, sr, raw, "wav32f")
+        before, clip_text = None, ""
+        if forced:
+            before = os.path.join(self.single_dir, f"run{rid}", "before", f"{inp.stem} clipped.wav")
+            write_audio(y, sr, before, "wav32f")
+            lv = sorted({round(db(v), 1) for hi_lo in info["levels"] for v in hi_lo if v is not None})
+            clip_text = " / ".join(f"{v:.1f}" for v in lv) + " dBFS"
         run = Run(rid, settings.preset, settings.mode, label, raw, float(np.abs(x).max()), info["time"],
                   info.get("device", "cpu"), info["clipped_frac"],
                   "\n".join(report_lines(info, y.shape[1], settings.preset)), RestorationMap(y, x, sr),
-                  reused=info.get("reused_analysis", False))
+                  reused=info.get("reused_analysis", False), before_path=before, clip_text=clip_text)
         del x, y
         with self.lock:
             if self.input is not inp:
@@ -348,11 +386,11 @@ class Session:
     def export(self, rid, out):
         """(path, note) of a result in the chosen output format, written once per format and gain."""
         run = self.run(rid)
-        gain, note = output_gain(run.peak, out)
-        key = (out.fmt, round(gain, 9))
-        path = run.exports.get(key)
-        if path and os.path.exists(path):
-            return path, note
+        gain, note, _ = output_gain(run.peak, out)
+        key = (out.fmt, round(gain, 9), note)
+        got = run.exports.get(key)
+        if got and os.path.exists(got[0]):
+            return got
         if out.fmt == "wav32f" and gain == 1.0:
             path = run.raw_path
         else:
@@ -360,8 +398,8 @@ class Session:
             sub = out.fmt if gain == 1.0 else f"{out.fmt}_{db(gain):+.2f}dB"
             path = os.path.join(os.path.dirname(run.raw_path), sub,
                                 output_name(self.input.stem, run.label, run.preset, out.fmt))
-            write_audio(x, sr, path, out.fmt, gain)
-        run.exports[key] = path
+            note += clip_note(write_audio(x, sr, path, out.fmt, gain), x.size)
+        run.exports[key] = (path, note)
         return path, note
 
     # ---- snippets -------------------------------------------------------------------------------
@@ -388,15 +426,16 @@ class Session:
         with self.lock:
             self.custom = int(np.clip(round(seconds * self.input.sr), 0, self.input.frames - 1))
 
-    def _peak_at(self, run, s):
-        """Peak of the input (run None) or of a result within 2 ms of a snippet's peak."""
-        key = (run.id if run else 0, s.center, s.channel)
+    def _peak_at(self, run, s, before=False):
+        """Peak of a result (or of its "before", the input when run is None) within 2 ms of a snippet's
+        peak."""
+        key = (("b", self._vid("Before", run)) if before or run is None else run.id, s.center, s.channel)
         v = self.peaks.get(key)
         if v is None:
             inp = self.input
             w = max(1, int(0.002 * inp.sr))
-            seg = read_segment(run.raw_path if run else inp.view_path, s.center - w, s.center + w + 1,
-                               inp.frames, inp.channels)
+            path = self._before(run) if before or run is None else run.raw_path
+            seg = read_segment(path, s.center - w, s.center + w + 1, inp.frames, inp.channels)
             v = self.peaks[key] = float(np.abs(seg[:, s.channel]).max())
         return v
 
@@ -415,7 +454,8 @@ class Session:
                 if s.fallback:
                     lab = f"Input peak · {t} · {names[s.channel]}" + (" (nothing was restored)" if self.runs else "")
                 else:
-                    lab = f"{i + 1}/{n} · {t} · {names[s.channel]} · peak {db(self._peak_at(None, s)):+.1f}"
+                    lab = (f"{i + 1}/{n} · {t} · {names[s.channel]} · peak "
+                           f"{db(self._peak_at(run, s, before=True)):+.1f}")
                     if run is not None:
                         lab += f" → {db(self._peak_at(run, s)):+.1f} dBFS (#{run.id})"
                     else:
@@ -437,10 +477,27 @@ class Session:
             return int(np.clip(center - n // 2, 0, inp.frames - n)), n
 
     # ---- views ----------------------------------------------------------------------------------
+    def _before(self, run):
+        """The "before" of a result: the input, or the input clipped at the result's forced clip level."""
+        return run.before_path if run is not None and run.before_path else self.input.view_path
+
+    def _vid(self, view, run):
+        """Which signal a view shows, for caching: the result's id, or for 'Before' 0 (the input) or the id of
+        a result with its own "before"."""
+        if view == "Before" or run is None:
+            return run.id if run is not None and run.before_path else 0
+        return run.id
+
+    def before_label(self, run):
+        """What 'Before' shows next to a result."""
+        if run is not None and run.before_path:
+            return f"input clipped at {run.clip_text} (forced in #{run.id})"
+        return "input"
+
     def _signals(self, view, run, a, b):
-        """(input, shown signal) for samples [a, b) of all channels."""
+        """(before, shown signal) for samples [a, b) of all channels."""
         inp = self.input
-        y = read_segment(inp.view_path, a, b, inp.frames, inp.channels)
+        y = read_segment(self._before(run), a, b, inp.frames, inp.channels)
         if view == "Before" or run is None:
             return y, y
         x = read_segment(run.raw_path, a, b, inp.frames, inp.channels)
@@ -457,7 +514,7 @@ class Session:
         pad = R.context_samples(sr)
         y, sig = self._signals(view, run, start - pad, start + n + pad)
         y, sig = y[:, ch], sig[:, ch]
-        key = (view, run.id if view != "Before" else 0, start, n, ch, scale)
+        key = (view, self._vid(view, run), start, n, ch, scale)
         with self.lock:
             spec = self.specs.get(key)
             if spec is not None:
@@ -470,7 +527,7 @@ class Session:
                     self.specs.popitem(last=False)
         yv, sv = y[pad:pad + n], sig[pad:pad + n]
         if view == "Before":
-            layers, title = [(yv, R.BLUE)], "BEFORE  ·  input"
+            layers, title = [(yv, R.BLUE)], f"BEFORE  ·  {self.before_label(run)}"
         elif view == "After":
             layers, title = [(sv, R.ORANGE), (yv, R.BLUE)], f"AFTER  ·  {run.name}"
         else:
@@ -498,7 +555,7 @@ class Session:
             sig[-f:] *= ramp[::-1]
         d = os.path.join(self.dir, "clips", str(time.time_ns()))  # a new URL each time (no stale browser cache)
         os.makedirs(d, exist_ok=True)
-        tag = "before" if view == "Before" else f"{view.lower()} result {run.id}"
+        tag = self._tag(view, run)
         path = os.path.join(d, f"{inp.stem} {R.fmt_time(start / inp.sr).replace(':', '-')} {tag}.wav")
         sf.write(path, sig, inp.sr, subtype="PCM_16")
         with self.lock:
@@ -509,18 +566,24 @@ class Session:
         return path, start, n
 
     # ---- full length ----------------------------------------------------------------------------
+    def _tag(self, view, run):
+        if view != "Before":
+            return f"{view.lower()} result {run.id}"
+        return f"before result {run.id} (clipped)" if run is not None and run.before_path else "before"
+
     def _reader(self, view, run, ch):
-        """read(a, b) of one channel of the input, a result or their difference, zeros outside the file."""
+        """read(a, b) of one channel of the before, a result or their difference, zeros outside the file."""
         inp = self.input
-        ry = lambda a, b: read_segment(inp.view_path, a, b, inp.frames, inp.channels)[:, ch]
+        before = self._before(run)
+        ry = lambda a, b: read_segment(before, a, b, inp.frames, inp.channels)[:, ch]
         if view == "Before" or run is None:
             return ry
         rx = lambda a, b: read_segment(run.raw_path, a, b, inp.frames, inp.channels)[:, ch]
         return rx if view == "After" else (lambda a, b: rx(a, b) - ry(a, b))
 
     def _envelope(self, view, run, ch):
-        """Full-length waveform envelope of the input ('Before'), a result ('After') or the delta."""
-        key = (view, run.id if run is not None and view != "Before" else 0, ch)
+        """Full-length waveform envelope of the before, a result ('After') or the delta."""
+        key = (view, self._vid(view, run), ch)
         with self.lock:
             env = self.envs.get(key)
         if env is None:
@@ -539,7 +602,7 @@ class Session:
         if run is None:
             view = "Before"
         sr = inp.sr
-        key = (view, run.id if view != "Before" else 0, ch, scale)
+        key = (view, self._vid(view, run), ch, scale)
         with self.lock:
             spec = self.ov_specs.get(key)
             if spec is not None:
@@ -552,7 +615,7 @@ class Session:
                     self.ov_specs.popitem(last=False)
         ey = self._envelope("Before", run, ch)
         if view == "Before":
-            layers, title = [(ey, R.BLUE)], "BEFORE  ·  input  ·  full length"
+            layers, title = [(ey, R.BLUE)], f"BEFORE  ·  {self.before_label(run)}  ·  full length"
         elif view == "After":
             layers, title = [(self._envelope("After", run, ch), R.ORANGE), (ey, R.BLUE)], f"AFTER  ·  {run.name}"
         else:
@@ -578,15 +641,14 @@ class Session:
             gain_db = self.playback_gain_db()
         if run is None:
             view = "Before"
-        key = (view, run.id if view != "Before" else 0, round(gain_db, 6))
+        key = (view, self._vid(view, run), round(gain_db, 6))
         with self.lock:
             path = self.full_files.get(key)
         if path and os.path.exists(path):
             return path
         d = os.path.join(self.single_dir, "full", str(time.time_ns()))
         os.makedirs(d, exist_ok=True)
-        tag = "before" if view == "Before" else f"{view.lower()} result {run.id}"
-        path = os.path.join(d, f"{inp.stem} {tag}.wav")
+        path = os.path.join(d, f"{inp.stem} {self._tag(view, run)}.wav")
         g = np.float32(10 ** (gain_db / 20))
         with sf.SoundFile(path, "w", inp.sr, inp.channels, "PCM_16", format="WAV") as f:
             for a in range(0, inp.frames, 1 << 20):
@@ -616,22 +678,105 @@ class Session:
         else:
             path, start, n = self.snippet_audio(v)
             what, tl = "Snippet", f"{loads}:{start}:{n}"
-        which = "Before · the input" if v == "Before" else f"{v} · {run.name}"
+        which = f"Before · the {self.before_label(run)}" if v == "Before" else f"{v} · {run.name}"
         note = f"played at {gain_db:+.1f} dB, so the restored peaks don't clip" if gain_db < -0.05 else ""
         return {"path": path, "name": os.path.basename(path), "label": f"{what} · {which}", "note": note,
                 "tl": tl, "file": str(loads), "t0": start / inp.sr, "dur": n / inp.sr, "dl": kind == "snip"}
 
     def goto_x(self, x):
         """A click on the overview at column x: the snippet whose flag is there, else that moment."""
+        dur = self.input.frames / self.input.sr
+        self.goto_near(float(np.clip(x / R.PLOT_W, 0.0, 1.0)) * dur, SNAP_PX / R.PLOT_W * dur)
+
+    def goto_near(self, t, snap_s):
+        """The snippet whose peak is within snap_s seconds of t (its flag was clicked), else the moment t."""
         with self.lock:
             inp = self.input
             if self.snippets and not self.snippets[0].fallback:
-                xs = np.array([s.center for s in self.snippets]) / inp.frames * R.PLOT_W
-                i = int(np.argmin(np.abs(xs - x)))
-                if abs(xs[i] - x) <= SNAP_PX:
+                ts = np.array([s.center for s in self.snippets]) / inp.sr
+                i = int(np.argmin(np.abs(ts - t)))
+                if abs(ts[i] - t) <= snap_s:
                     self.goto(i)
                     return
-            self.goto_time(float(np.clip(x / R.PLOT_W, 0.0, 1.0)) * inp.frames / inp.sr)
+            self.goto_time(float(np.clip(t, 0.0, inp.frames / inp.sr)))
+
+    # ---- horizontal mode --------------------------------------------------------------------------
+    def strip_value(self, view, scale):
+        """What the horizontal mode shows, for the browser: the full-length view as a strip of tiles of
+        STRIP_S seconds each (strip_tile), the rulers beside it (strip_ruler). Every call is a new version."""
+        with self.lock:
+            inp, run, ch, peak = self.input, self.run(), self.channel, self.peak_ref()
+            start, n = self.region()
+            v = view if run is not None else "Before"
+            sr = inp.sr
+            markers = [] if not self.snippets or self.snippets[0].fallback else \
+                [(s.center / sr, str(i + 1), self.custom is None and i == self.snip_idx)
+                 for i, s in enumerate(self.snippets)]
+            self.strip_ver += 1
+            ver = self.strip_ver
+            self.strips[ver] = dict(input=inp, view=v, run=run, ch=ch, scale=scale, peak=peak, markers=markers,
+                                    region=(start / sr, (start + n) / sr))
+            while len(self.strips) > 4:
+                self.strips.popitem(last=False)
+        names = channel_names(inp.channels)
+        if v == "Before":
+            title = f"BEFORE  ·  {self.before_label(run)}"
+        else:
+            title = f"{v.upper()}  ·  {run.name}" + ("  ·  after - before" if v == "Delta" else "")
+        return {"sid": self.id, "v": ver, "sr": sr, "frames": inp.frames, "n": int(round(STRIP_S * sr)),
+                "title": title, "color": "#%02x%02x%02x" % R.VIEW_COLORS[v], "view": v,
+                "scale": scale.capitalize(), "chans": names, "chan": names[ch], "result": run is not None,
+                "region": [start / sr, (start + n) / sr]}
+
+    def strip_tile(self, ver, i, w, h):
+        """Tile i of version `ver` of the strip as JPEG bytes (None if it is gone): STRIP_S seconds at w x h
+        pixels (the last tile is narrower)."""
+        key = (ver, i, w, h)
+        with self.lock:
+            p = self.strips.get(ver)
+            data = self.tiles.get(key)
+            if data is not None:
+                self.tiles.move_to_end(key)
+                return data
+        inp = p and p["input"]
+        if p is None or inp is not self.input:
+            return None
+        sr, ch = inp.sr, p["ch"]
+        N = int(round(STRIP_S * sr))
+        a = i * N
+        if i < 0 or a >= inp.frames:
+            return None
+        n = min(N, inp.frames - a)
+        width = max(1, int(round(w * n / N)))
+        _, spec_h = R.strip_layout(h)
+        pad = R.context_samples(sr) + int(R.LIN_WIN_COLS * N / w) + 256
+        with _tile_slots:
+            y, sig = self._signals(p["view"], p["run"], a - pad, a + n + pad)
+            y, sig = y[:, ch], sig[:, ch]
+            spec = R.spectrogram_db(sig, pad, n, sr, width, spec_h, p["scale"], R.STRIP_OVERLAP, R.STRIP_ZERO_PAD)
+            yv, sv = y[pad:pad + n], sig[pad:pad + n]
+            layers = {"Before": [(yv, R.BLUE)], "After": [(sv, R.ORANGE), (yv, R.BLUE)],
+                      "Delta": [(yv, R.GHOST), (sv, R.ORANGE)]}[p["view"]]
+            img = R.render_strip(spec, layers, sr, a / sr, n, p["peak"], h, p["markers"], p["region"],
+                                 first=i == 0, last=a + n >= inp.frames)
+        buf = io.BytesIO()
+        Image.fromarray(img).save(buf, "JPEG", quality=90, subsampling=0)
+        data = buf.getvalue()
+        with self.lock:
+            self.tiles[key] = data
+            while len(self.tiles) > STRIP_KEEP:
+                self.tiles.popitem(last=False)
+        return data
+
+    def strip_ruler(self, ver, h):
+        """The strip's rulers (dB, Hz) as PNG bytes, None if the version is gone."""
+        with self.lock:
+            p = self.strips.get(ver)
+        if p is None or p["input"] is not self.input:
+            return None
+        buf = io.BytesIO()
+        Image.fromarray(R.render_ruler(p["peak"], p["input"].sr, p["scale"], h)).save(buf, "PNG")
+        return buf.getvalue()
 
     def view_keys(self, view, scale):
         """What each image and player shows, so unchanged ones are not rendered and sent again (and a playing
@@ -639,7 +784,7 @@ class Session:
         with self.lock:
             run = self.run()
             v = view if run is not None else "Before"
-            rid = run.id if run is not None and v != "Before" else 0
+            rid = self._vid(v, run)
             peak = round(self.peak_ref(), 9)
             start, n = self.region()
             snips = tuple((s.center, s.channel, s.fallback) for s in self.snippets)
